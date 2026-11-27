@@ -1,0 +1,28 @@
+{
+  "timezone": "America/New_York",
+  "unifi": {
+    "host": "https://192.168.1.1:12445",
+    "token": "PASTE-YOUR-UNIFI-ACCESS-API-TOKEN",
+    "verify_tls": false
+  },
+  "web": {
+    "bind": "0.0.0.0",
+    "port": 8480,
+    "password": "change-me"
+  },
+  "telegram": {
+    "token": "",
+    "allowed_chat_ids": []
+  },
+  "calendar": {
+    "ical_url": "",
+    "refresh_minutes": 10,
+    "title_prefix": "Unlock:",
+    "buffer_before_min": 0,
+    "buffer_after_min": 0,
+    "end_action": "reset"
+  },
+  "default_unlock_minutes": 60,
+  "tick_seconds": 30,
+  "db_path": "data/doorcontrol.db"
+}

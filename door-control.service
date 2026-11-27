@@ -1,0 +1,14 @@
+[Unit]
+Description=Fairgrounds Door Control (UniFi Access scheduler, web UI, Telegram bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=office
+WorkingDirectory=/srv/fair-apps/door-control
+ExecStart=/usr/bin/python3 run.py config.json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
