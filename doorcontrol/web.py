@@ -14,6 +14,27 @@ from .unifi import UnifiError
 
 log = logging.getLogger("doorcontrol")
 STATIC = os.path.join(os.path.dirname(__file__), "static")
+CT = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+}
+# Sent on every response (as Awards): no inline script or style, never framed.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+    "form-action 'self'",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Robots-Tag": "noindex, nofollow",
+    "Cache-Control": "no-store",
+}
+
+
+def is_loopback(address):
+    return address in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
 
 def make_server(cfg, engine):
@@ -26,14 +47,28 @@ def make_server(cfg, engine):
             log.debug("web: " + fmt, *args)
 
         # ---- helpers ----
+        def end_headers(self):
+            for k, v in SECURITY_HEADERS.items():
+                self.send_header(k, v)
+            super().end_headers()
+
         def _send(self, code, obj=None, ctype="application/json", raw=None):
             body = raw if raw is not None else json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        def _static(self, name):
+            root = os.path.realpath(STATIC)
+            f = os.path.realpath(os.path.join(root, name))
+            if os.path.dirname(f) != root or not os.path.isfile(f):
+                return self._send(404, {"error": "Not found"})
+            with open(f, "rb") as fh:
+                raw = fh.read()
+            ctype = CT.get(os.path.splitext(f)[1], "application/octet-stream")
+            return self._send(200, ctype=ctype, raw=raw)
 
         def _authed(self):
             h = self.headers.get("Authorization", "")
@@ -57,15 +92,21 @@ def make_server(cfg, engine):
             return json.loads(self.rfile.read(n) or b"{}")
 
         def _route(self, method):
+            path = self.path.split("?")[0]
+            # Docker's health check, from inside the container only.
+            if method == "GET" and path == "/health":
+                if is_loopback(self.client_address[0]) and not self.headers.get(
+                    "CF-Connecting-IP"
+                ):
+                    return self._send(200, {"ok": True})
+                return self._send(404, {"error": "Not found"})
             if not self._authed():
                 return
-            path = self.path.split("?")[0]
             try:
                 if method == "GET" and path in ("/", "/index.html"):
-                    with open(os.path.join(STATIC, "index.html"), "rb") as f:
-                        return self._send(
-                            200, ctype="text/html; charset=utf-8", raw=f.read()
-                        )
+                    return self._static("index.html")
+                if method == "GET" and path.startswith("/static/"):
+                    return self._static(path[len("/static/") :])
                 if method == "GET" and path == "/api/doors":
                     return self._send(200, engine.status())
                 m = re.fullmatch(r"/api/doors/([^/]+)/action", path)

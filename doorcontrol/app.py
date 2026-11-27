@@ -14,7 +14,14 @@ from .web import make_server
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
-    path = argv[0] if argv else os.environ.get("DOORCONTROL_CONFIG", "config.json")
+    # DATA_DIR holds config.json and the database (/data in Docker, data/ locally).
+    data_dir = os.environ.get("DATA_DIR", "data")
+    path = (
+        argv[0]
+        if argv
+        else os.environ.get("DOORCONTROL_CONFIG")
+        or os.path.join(data_dir, "config.json")
+    )
     with open(path) as f:
         cfg = json.load(f)
     logging.basicConfig(
@@ -29,8 +36,10 @@ def main(argv=None):
     if not u.get("token") or u["token"].startswith("PASTE"):
         sys.exit("Set unifi.token in config.json.")
 
-    db_path = cfg.get("db_path", "data/doorcontrol.db")
-    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    if "db_path" in cfg:
+        log.warning("config.json: db_path is no longer used; DATA_DIR sets the folder.")
+    os.makedirs(data_dir, exist_ok=True)
+    db_path = os.path.join(data_dir, "doorcontrol.db")
     tz = ZoneInfo(cfg.get("timezone", "America/New_York"))
     client = UnifiClient(u["host"], u["token"], u.get("verify_tls", False))
     cal_cfg = cfg.get("calendar", {})
@@ -42,12 +51,10 @@ def main(argv=None):
     engine.start(int(cfg.get("tick_seconds", 30)))
     Bot(cfg.get("telegram", {}), engine).start()
 
-    server = make_server(web_cfg, engine)
-    log.info(
-        "Door Control running on http://%s:%s",
-        web_cfg.get("bind", "0.0.0.0"),
-        web_cfg.get("port", 8480),
-    )
+    bind = os.environ.get("BIND", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8480"))
+    server = make_server({**web_cfg, "bind": bind, "port": port}, engine)
+    log.info("Door Control running on http://%s:%s", bind, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

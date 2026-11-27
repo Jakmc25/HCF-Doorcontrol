@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+config.json
+data/
+*.db
+tests
+docs
+.claude
+__pycache__
+*.pyc
+mock_unifi.py
+door-control.service
