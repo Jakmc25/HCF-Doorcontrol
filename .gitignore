@@ -3,3 +3,6 @@ data/
 __pycache__/
 *.pyc
 *.db
+
+# Personal Claude Code settings
+.claude/settings.local.json
