@@ -164,7 +164,7 @@ class Resp:
 class Stack:
     """Web server + engine + fake UniFi controller, with its own data folder."""
 
-    def __init__(self, env=None, data_dir=None):
+    def __init__(self, env=None, data_dir=None, max_connections=64):
         self.mock = mock_unifi.Mock()
         self.usrv = mock_unifi.make_server(self.mock)
         client = UnifiClient(
@@ -174,7 +174,9 @@ class Stack:
         db = DB(os.path.join(self.data, "doorcontrol.db"))
         self.eng = Clock({"timezone": "America/New_York"}, db, client)
         with mock.patch.dict(os.environ, {**ENV, **(env or {})}):
-            self.web = web.make_server(self.eng, self.data, "127.0.0.1", 0)
+            self.web = web.make_server(
+                self.eng, self.data, "127.0.0.1", 0, max_connections
+            )
         threading.Thread(target=self.web.serve_forever, daemon=True).start()
 
     def close(self):
@@ -733,12 +735,13 @@ class BreakGlassTests(Base):
         self.assertEqual(a["max-age"], str(web.SESSION_DAYS * 86400))
         ck = r.cookie("doors_auth").split(";")[0]
         self.assertEqual(
-            self.st.call("GET", "/api/bootstrap", cookie=ck).json()["user"], "admin"
+            self.st.call("GET", "/api/bootstrap", cookie=ck).json()["user"],
+            "admin:admin",
         )
         row = self.st.log_rows()[0]
         self.assertEqual(
             (row["action"], row["detail"], row["user"]),
-            ("sign-in", "signed in (password)", "admin"),
+            ("sign-in", "signed in (password)", "admin:admin"),
         )
         self.assertNotIn(PASSWORD, json.dumps(self.st.log_rows()))
 
@@ -1079,6 +1082,238 @@ class SecurityTests(Base):
             self.assertEqual(web.is_loopback(addr), ok, addr)
 
 
+# ---------------------------------------------------------------- review round 1
+def raw_request(st, lines, timeout=5):
+    """Send exact header lines; return (status, body)."""
+    with socket.create_connection(
+        ("127.0.0.1", st.web.server_address[1]), timeout
+    ) as s:
+        s.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        data = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    head, _, body = data.partition(b"\r\n\r\n")
+    return int(head.split()[1]), head.decode(), body
+
+
+class TrustTests(Base):
+    """S1/Q1: CF-Connecting-IP and the public Host count only from TRUSTED_PROXIES."""
+
+    def untrusted(self):
+        st = Stack(
+            {"TRUSTED_PROXIES": "10.99.0.0/16"}
+        )  # the test peer 127.0.0.1 is not in it
+        self.addCleanup(st.close)
+        return st
+
+    def test_untrusted_peer_cannot_claim_cloudflare(self):
+        st = self.untrusted()
+        st.web.auth.set_password("admin", PASSWORD)
+        cf = {"CF-Connecting-IP": "203.0.113.5"}
+        # The public Host from a non-proxy peer is just an unknown host: refused, never open.
+        self.assertEqual(st.call("GET", "/", HOST).status, 403)
+        self.assertEqual(st.call("GET", "/api/auth/google/start", HOST).status, 403)
+        r = st.call("POST", "/api/login", HOST, {"name": "admin", "password": PASSWORD})
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(r.cookie("doors_auth"))
+        # A fake CF header on the LAN address is ignored (not remote).
+        info = st.call("GET", "/api/login-info", LAN, headers=cf).json()
+        self.assertFalse(info["remote"])
+
+    def test_rotating_headers_from_non_proxy_peer_hit_429(self):
+        st = self.untrusted()
+        st.web.auth.set_password("admin", PASSWORD)
+        for i in range(10):
+            r = st.call(
+                "POST",
+                "/api/login",
+                LAN if i % 2 else HOST,
+                {"name": "admin", "password": "wrong"},
+                headers={"CF-Connecting-IP": "203.0.113.%d" % i},
+            )
+            self.assertEqual(r.status, 403, i)
+        # LAN host attempts reach the login check and count against the real peer.
+        counted = sum(len(v) for v in st.web.limiter.by_address.values())
+        self.assertEqual(set(st.web.limiter.by_address), {"127.0.0.1"})
+        for i in range(10 - counted):
+            st.call(
+                "POST",
+                "/api/login",
+                LAN,
+                {"name": "admin", "password": "wrong"},
+                headers={"CF-Connecting-IP": "203.0.114.%d" % i},
+            )
+        r = st.call(
+            "POST",
+            "/api/login",
+            LAN,
+            {"name": "admin", "password": PASSWORD},
+            headers={"CF-Connecting-IP": "203.0.115.1"},
+        )
+        self.assertEqual(r.status, 429, "11th attempt")
+
+    def test_trusted_proxy_header_honored(self):
+        self.st.web.auth.set_password("admin", PASSWORD)
+        r = self.st.call(
+            "POST",
+            "/api/login",
+            body={"name": "admin", "password": "wrong"},
+            headers={"CF-Connecting-IP": "198.51.100.77"},
+        )
+        self.assertEqual(r.status, 401)
+        self.assertIn("198.51.100.77", self.st.web.limiter.by_address)
+        self.assertNotIn("127.0.0.1", self.st.web.limiter.by_address)
+
+    def test_overall_cap(self):
+        self.st.web.auth.set_password("admin", PASSWORD)
+        for n in range(5):
+            for _ in range(10):
+                self.st.call(
+                    "POST",
+                    "/api/login",
+                    body={"name": "admin", "password": "wrong"},
+                    headers={"CF-Connecting-IP": "198.51.101.%d" % n},
+                )
+        r = self.st.call(
+            "POST",
+            "/api/login",
+            body={"name": "admin", "password": PASSWORD},
+            headers={"CF-Connecting-IP": "198.51.101.200"},
+        )
+        self.assertEqual(
+            r.status, 429, "50 failures in total lock the password sign-in"
+        )
+        # Google sign-in is not affected.
+        self.assertEqual(self.st.google(JAKE).status, 200)
+
+    def test_limiter_prunes(self):
+        lim = web.FailureLimiter()
+        with mock.patch("time.time", return_value=1000.0):
+            for i in range(30):
+                lim.failed("10.0.0.%d" % i)
+        self.assertEqual(len(lim.by_address), 30)
+        with mock.patch("time.time", return_value=1000.0 + 901):
+            self.assertTrue(lim.allowed("10.0.0.1"))
+        self.assertEqual(lim.by_address, {})
+        with mock.patch("time.time", return_value=5000.0):
+            for i in range(500):
+                lim.failed("10.1.%d.%d" % (i // 250, i % 250))
+        self.assertLessEqual(lim.total(), 50, "bounded by the overall cap")
+
+    def test_proxy_list(self):
+        nets = web.proxy_list(web.DEFAULT_TRUSTED_PROXIES)
+        for addr, ok in (
+            ("127.0.0.1", True),
+            ("::1", True),
+            ("::ffff:127.0.0.1", True),
+            ("172.18.0.1", True),
+            ("172.17.0.1", True),
+            ("192.168.1.50", False),
+            ("10.0.0.1", False),
+            ("nonsense", False),
+        ):
+            self.assertEqual(web.peer_in(addr, nets), ok, addr)
+        with self.assertRaises(SystemExit):
+            web.proxy_list("not-an-ip")
+        self.assertEqual(web.proxy_list(""), [])
+
+
+class RequestLimitTests(Base):
+    def test_bad_content_length_is_400(self):
+        st = self.st
+        for value in ("-1", "abc", "-99999"):
+            with self.subTest(value):
+                status, _, body = raw_request(
+                    st,
+                    [
+                        "POST /api/login HTTP/1.1",
+                        "Host: " + HOST,
+                        "Content-Type: application/json",
+                        "Content-Length: " + value,
+                        "Connection: close",
+                    ],
+                )
+                self.assertEqual(status, 400)
+                self.assertIn(b"error", body)
+        cookie, token = st.with_csrf(st.session())
+        status, _, _ = raw_request(
+            st,
+            [
+                "POST /api/schedules HTTP/1.1",
+                "Host: " + HOST,
+                "Cookie: " + cookie,
+                "X-CSRF-Token: " + token,
+                "Content-Length: -1",
+                "Connection: close",
+            ],
+        )
+        self.assertEqual(status, 400)
+
+    def test_idle_connection_times_out(self):
+        self.assertEqual(web.Handler.timeout, 30)
+        with mock.patch.object(web.Handler, "timeout", 0.5):
+            s = socket.create_connection(("127.0.0.1", self.st.web.server_address[1]))
+            s.settimeout(5)
+            t = time.time()
+            self.assertEqual(s.recv(10), b"")
+            self.assertLess(time.time() - t, 4)
+            s.close()
+
+    def test_connection_cap(self):
+        self.assertEqual(web.MAX_CONNECTIONS, 64)
+        st = Stack(max_connections=2)
+        self.addCleanup(st.close)
+        port = st.web.server_address[1]
+        with mock.patch.object(web.Handler, "timeout", 5):
+            held = [socket.create_connection(("127.0.0.1", port)) for _ in range(2)]
+            time.sleep(0.3)
+            extra = socket.create_connection(("127.0.0.1", port))
+            extra.settimeout(2)
+            t = time.time()
+            self.assertEqual(extra.recv(10), b"", "closed at once")
+            self.assertLess(time.time() - t, 1.5)
+            extra.close()
+            for s in held:
+                s.close()
+            time.sleep(0.3)
+            self.assertEqual(st.call("GET", "/api/login-info").status, 200)
+
+    def test_other_methods_get_plain_json(self):
+        ck = self.st.session()
+        for method in ("PATCH", "OPTIONS"):
+            r = self.st.call(method, "/api/doors", cookie=ck)
+            self.assertEqual(r.status, 405)
+            self.assertEqual(
+                r.json(), {"error": "This kind of request is not supported."}
+            )
+            self.assertIn("script-src 'self'", r.header("Content-Security-Policy"))
+        r = self.st.call("HEAD", "/")
+        self.assertEqual((r.status, r.body), (405, b""))
+        self.assertIn("frame-ancestors 'none'", r.header("Content-Security-Policy"))
+        r = self.st.call("TRACE", "/")
+        self.assertEqual(r.status, 501)
+        self.assertEqual(r.json(), {"error": "This kind of request is not supported."})
+        self.assertEqual(r.header("X-Frame-Options"), "DENY")
+        status, head, body = raw_request(self.st, ["GARBAGE"])
+        self.assertEqual(status, 400)
+        self.assertIn("Content-Security-Policy", head)
+        self.assertNotIn(b"<html", body.lower())
+
+    def test_unifi_errors_shown_plainly(self):
+        self.st.mock.fail = True
+        with self.assertLogs("doorcontrol", "WARNING"):
+            r = self.st.change("POST", "/api/doors/event/action", {"action": "lock"})
+        self.assertEqual(r.status, 502)
+        self.assertNotIn(b"CODE_", r.body)
+        self.assertNotIn(b"{\\", r.body)
+        self.st.eng.last_error = "Traceback secret"
+        h = self.st.call("GET", "/api/health", cookie=self.st.session()).json()
+        self.assertNotIn("secret", h["scheduler_error"])
+
+
 # ---------------------------------------------------------------- repo
 # Copied unchanged from Awards (see CLAUDE.md "Shared code"). Changing them is a deliberate
 # hash bump here and in CLAUDE.md after copying the newer Awards version.
@@ -1131,8 +1366,10 @@ class RepoTests(unittest.TestCase):
                 "GOOGLE_ALLOWED_EMAILS",
                 "PUBLIC_HOSTS",
                 "ALLOWED_HOSTS",
+                "TRUSTED_PROXIES",
             },
         )
+        self.assertEqual(env["TRUSTED_PROXIES"], web.DEFAULT_TRUSTED_PROXIES)
         self.assertEqual(env["GOOGLE_CLIENT_ID"], "")
         self.assertEqual(env["GOOGLE_CLIENT_SECRET"], "")
         self.assertEqual(env["GOOGLE_ALLOWED_EMAILS"], "")
@@ -1143,7 +1380,7 @@ class RepoTests(unittest.TestCase):
             self.assertIn(h, hosts)
         compose = read("compose.yaml")
         for k in env:
-            self.assertIn("%s: ${%s:-}" % (k, k), compose)
+            self.assertIn("%s: ${%s:-" % (k, k), compose)
 
     def test_claude_md_pins_shared_modules(self):
         claude = read("CLAUDE.md")
@@ -1193,6 +1430,48 @@ class RepoTests(unittest.TestCase):
             "docker compose exec app python manage.py",
         ):
             self.assertIn(needed, readme)
+
+    def test_compose_hardening(self):
+        compose = read("compose.yaml")
+        for needed in (
+            "cap_drop:",
+            "- ALL",
+            "pids_limit:",
+            "mem_limit:",
+            "read_only: true",
+        ):
+            self.assertIn(needed, compose)
+
+    def test_server_blocks_are_valid_bash_and_use_no_image_tag(self):
+        for name in ("CLAUDE.md", "README.md"):
+            text = read(name)
+            self.assertNotIn(
+                "door-control:1.0.0", text.replace("image: door-control", "")
+            )
+            for i, block in enumerate(re.findall(r"```bash\n(.*?)```", text, re.S)):
+                with self.subTest(name, block=i):
+                    r = subprocess.run(
+                        ["bash", "-n"], input=block, capture_output=True, text=True
+                    )
+                    self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_first_move_failure_paths_restore_the_old_service(self):
+        claude = read("CLAUDE.md")
+        block = claude.split("### First move")[1].split("```bash\n")[1].split("```")[0]
+        after_stop = block.split("sudo systemctl stop door-control")[1]
+        before_ok = after_stop.split("trap - ERR")[0]
+        # Every explicit failure after the stop goes through restore_old.
+        for line in before_ok.splitlines():
+            if line.startswith("if ") and "exit 1" in line:
+                self.assertIn("restore_old", line)
+        self.assertIn("set -eE", block)
+        self.assertIn("trap restore_old ERR", block)
+        self.assertIn(
+            "Health.Status", before_ok, "rollback if the container is not healthy"
+        )
+        self.assertIn(
+            "sqlite3", block, "database copied with SQLite's backup (WAL safe)"
+        )
 
 
 if __name__ == "__main__":

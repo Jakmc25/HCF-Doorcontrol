@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from .db import DB
 from .engine import Engine
-from .ical import Calendar
+from .ical import Calendar, check_url
 from .telegram_bot import Bot
 from .unifi import UnifiClient
 from .web import make_server
@@ -44,8 +44,25 @@ def main(argv=None):
     os.makedirs(data_dir, exist_ok=True)
     db_path = os.path.join(data_dir, "doorcontrol.db")
     tz = ZoneInfo(cfg.get("timezone", "America/New_York"))
-    client = UnifiClient(u["host"], u["token"], u.get("verify_tls", False))
+    try:
+        client = UnifiClient(
+            u["host"],
+            u["token"],
+            u.get("verify_tls", False),
+            cert_sha256=u.get("cert_sha256") or None,
+        )
+    except ValueError as e:
+        sys.exit(str(e))
+    if u["host"].startswith("https") and not client.pinned and not u.get("verify_tls"):
+        log.warning(
+            "unifi.cert_sha256 is not set: the console's certificate is not checked "
+            "(see README, 'Pin the UniFi console certificate')."
+        )
     cal_cfg = cfg.get("calendar", {})
+    try:
+        check_url(cal_cfg.get("ical_url"))
+    except ValueError as e:
+        sys.exit(str(e))
     calendar = Calendar(cal_cfg, tz) if cal_cfg.get("ical_url") else None
     engine = Engine(cfg, DB(db_path), client, calendar)
 

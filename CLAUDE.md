@@ -75,7 +75,12 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (empty),
   `PUBLIC_HOSTS=doors.jakemc.me`,
   `ALLOWED_HOSTS=192.168.1.160:8480,fair-server:8480,localhost:8480,127.0.0.1:8480` (empty = refuse every
-  fair-network address). README step 3 has the block that writes it.
+  fair-network address), optional `TRUSTED_PROXIES` (default `127.0.0.1/32,::1/128,172.16.0.0/12`:
+  only these TCP peers may vouch for `CF-Connecting-IP` and the public Host; wrong value = public
+  sign-in refused, never open; README "Trusted proxies" shows how to check it). README step 3 has the
+  block that writes `.env`.
+- `config.json` may set `unifi.cert_sha256` (console certificate fingerprint; README "Pin the UniFi
+  console certificate"). Unset: not checked, one warning at startup.
 - Deploy (run by the person deploying, see People in .claude/standards/STANDARDS.md), after a PR merges:
   ```bash
   (set -e; cd /srv/fair-apps/door-control && git checkout main && git pull --ff-only && docker compose up -d --build && docker compose ps)
@@ -89,10 +94,12 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
 ### First move from systemd to Docker (1.0.0, one time)
 Order: README step 2 (Google client) and step 3 (`.env`) -> this block -> break-glass account ->
 README step 4 (Cloudflare row) -> manual checks. Pull and build happen while the old service still runs;
-the old dashboard page may not load during the build, the scheduler keeps working. If anything fails
-after the old service stops, the block stops the container and starts the old service again.
+the old dashboard page may not load during the build, the scheduler keeps working. Once the old service
+is stopped, every failure (a failed command, the old service still running, or a container that is not
+healthy within 90 seconds) runs `restore_old`: stop the container, check out the old commit and start the
+old service again.
 ```bash
-(set -e
+(set -eE
 cd /srv/fair-apps/door-control
 test -f .env || { echo "Stop: create .env first (README step 3)."; exit 1; }
 mkdir -p /srv/fair-apps/door-control-backups && chmod 700 /srv/fair-apps/door-control-backups
@@ -102,24 +109,36 @@ git pull --ff-only
 docker compose build
 BK=/srv/fair-apps/door-control-backups/$(date +%Y%m%d-%H%M%S)
 mkdir -m 700 "$BK"
-trap 'echo "Deploy FAILED after the old service stopped: putting the old version back."; docker compose stop || true; git checkout -q "$(cat /srv/fair-apps/door-control-backups/pre-docker-commit)"; sudo systemctl enable --now door-control; systemctl is-active door-control' ERR
+restore_old() {
+  trap - ERR
+  echo "Deploy FAILED after the old service stopped: putting the old version back."
+  docker compose stop || true
+  git checkout -q "$(cat /srv/fair-apps/door-control-backups/pre-docker-commit)" || true
+  sudo systemctl enable --now door-control || true
+  systemctl is-active door-control || true
+  echo "Old version restored. Backup in $BK"
+}
+trap restore_old ERR
 sudo systemctl stop door-control
 sudo systemctl disable door-control
-if systemctl is-active --quiet door-control; then echo "Stop: the old door-control service is still running."; exit 1; fi
-cp -p data/doorcontrol.db config.json "$BK"/
+if systemctl is-active --quiet door-control; then echo "Stop: the old door-control service is still running."; restore_old; exit 1; fi
 umask 077
+python3 -c 'import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' data/doorcontrol.db "$BK/doorcontrol.db"
+cp -p config.json "$BK"/
 python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); c.pop("web",None); c.pop("db_path",None); json.dump(c,open(sys.argv[2],"w"),indent=2)' "$BK/config.json" "$BK/config.docker.json"
-docker compose create
-docker run --rm --user 0 -v door_control_data:/data -v "$BK":/src:ro door-control:1.0.0 sh -c 'if [ -e /data/doorcontrol.db ]; then echo "The volume already has a database; not overwriting it."; exit 1; fi; cp /src/doorcontrol.db /data/doorcontrol.db && cp /src/config.docker.json /data/config.json && chown 10001:10001 /data /data/doorcontrol.db /data/config.json && chmod 600 /data/config.json /data/doorcontrol.db'
+docker compose run --rm -T --no-deps --user 0 -v "$BK":/src:ro app sh -c 'if [ -e /data/doorcontrol.db ]; then echo "The volume already has a database; not overwriting it."; exit 1; fi; cp /src/doorcontrol.db /data/doorcontrol.db && cp /src/config.docker.json /data/config.json && chown 10001:10001 /data /data/doorcontrol.db /data/config.json && chmod 600 /data/config.json /data/doorcontrol.db'
 docker compose up -d
+STATUS=starting
+for i in $(seq 1 18); do sleep 5; STATUS=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q app)"); if [ "$STATUS" = healthy ]; then break; fi; done
+if [ "$STATUS" != healthy ]; then docker compose logs --tail=40; echo "Stop: the container is $STATUS, not healthy."; restore_old; exit 1; fi
 trap - ERR
-sleep 30
 docker compose ps
 docker compose logs --tail=40
 echo "Backup in $BK")
 ```
-`docker compose ps` must show `healthy`. Then create the break-glass account (above), then the
-Cloudflare row (README step 4). Until that row exists nobody can use the dashboard; that is expected.
+The database is copied with SQLite's backup (safe if it has `-wal`/`-shm` files). Then create the
+break-glass account (above), then the Cloudflare row (README step 4). Until that row exists nobody can
+use the dashboard; that is expected.
 
 Manual checks after the Cloudflare row: https://doors.jakemc.me shows the sign-in page; Google sign-in
 with a hardincountyfair.org account reaches the dashboard and the email shows in the header; a gmail.com
@@ -133,9 +152,9 @@ First remove the `doors.jakemc.me` row from the Cloudflare tunnel (that row only
 ```bash
 (set -e
 cd /srv/fair-apps/door-control
-docker compose down
+docker compose stop
 mv data/doorcontrol.db "data/doorcontrol.db.before-rollback-$(date +%Y%m%d-%H%M%S)"
-docker run --rm --user 0 -v door_control_data:/data:ro -v "$PWD/data":/out door-control:1.0.0 sh -c 'cp /data/doorcontrol.db /out/doorcontrol.db && chown --reference=/out /out/doorcontrol.db'
+docker compose run --rm -T --no-deps --user 0 -v "$PWD/data":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && chown --reference=/out /out/doorcontrol.db'
 git checkout "$(cat /srv/fair-apps/door-control-backups/pre-docker-commit)"
 sudo systemctl enable --now door-control
 sleep 5
@@ -162,9 +181,10 @@ None open in this app. Follow-ups elsewhere: dev-standards APPS.md needs a Door 
 ## History
 - 2026-11 first version: scheduler, web dashboard (shared HTTP Basic password), Telegram bot, Google
   Calendar sync; systemd service.
-- 1.0.0 (2026-11-27, feature/google-signin): Google sign-in (hardincountyfair.org) at doors.jakemc.me,
+- 1.0.0 (2026-11-27, feature/google-signin, review round 1 fixed): Google sign-in (hardincountyfair.org) at doors.jakemc.me,
   break-glass admin password, CSRF, host lockdown, who-did-it activity log (additive `log.user`),
-  Docker Compose, CSP + static split, black/prettier, VERSION/CHANGELOG.
+  Docker Compose, CSP + static split, black/prettier, VERSION/CHANGELOG. Review round 1: trusted
+  proxies, overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
 
 ## Team workflow
 - Standards: .claude/standards/ (synced from the dev-standards repo; don't edit here)

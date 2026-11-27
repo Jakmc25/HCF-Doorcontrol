@@ -1,7 +1,10 @@
 import base64
+import hashlib
 import json
 import os
 import sys
+import ssl
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -9,12 +12,13 @@ from unittest import mock
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import mock_unifi
-from doorcontrol import ical
+from doorcontrol import ical, unifi
 from doorcontrol.db import DB
 from doorcontrol.engine import (
     Engine,
@@ -392,6 +396,154 @@ class WebTests(unittest.TestCase):
         self.assertEqual(
             {d["name"] for d in statuses}, {"Event Center", "Office", "Main Gate"}
         )
+
+
+class UnifiTlsTests(unittest.TestCase):
+    """S3: optional pinning of the console certificate (checked before the token is sent)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        cls.cert = os.path.join(cls.dir, "c.pem")
+        cls.key = os.path.join(cls.dir, "k.pem")
+        try:
+            subprocess.run(
+                [
+                    "openssl",
+                    "req",
+                    "-x509",
+                    "-newkey",
+                    "rsa:2048",
+                    "-nodes",
+                    "-days",
+                    "2",
+                    "-subj",
+                    "/CN=127.0.0.1",
+                    "-keyout",
+                    cls.key,
+                    "-out",
+                    cls.cert,
+                ],
+                check=True,
+                capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            raise unittest.SkipTest("openssl not available")
+        der = ssl.PEM_cert_to_DER_cert(open(cls.cert).read())
+        cls.fp = hashlib.sha256(der).hexdigest()
+
+    def setUp(self):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert, self.key)
+        self.mock = mock_unifi.Mock()
+        self.srv = mock_unifi.make_server(self.mock, ssl_context=ctx)
+        self.url = "https://127.0.0.1:%d" % self.srv.server_address[1]
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_matching_fingerprint_connects(self):
+        colons = ":".join(self.fp[i : i + 2] for i in range(0, 64, 2)).upper()
+        c = UnifiClient(
+            self.url, mock_unifi.TOKEN, cert_sha256="sha256 Fingerprint=" + colons
+        )
+        self.assertTrue(c.pinned)
+        self.assertEqual(len(c.doors()), 3)
+
+    def test_wrong_fingerprint_refused_before_token(self):
+        c = UnifiClient(self.url, mock_unifi.TOKEN, cert_sha256="0" * 64)
+        with self.assertRaises(UnifiError) as e:
+            c.doors()
+        self.assertIn("certificate", str(e.exception))
+        self.assertEqual(self.mock.calls, [], "the request (and token) was never sent")
+
+    def test_unpinned_keeps_todays_behavior(self):
+        c = UnifiClient(self.url, mock_unifi.TOKEN)
+        self.assertFalse(c.pinned)
+        self.assertEqual(len(c.doors()), 3)
+
+    def test_fingerprint_format(self):
+        self.assertEqual(unifi.normalize_fingerprint("AB:" * 31 + "AB"), "ab" * 32)
+        for bad in ("", "abc", "zz" * 32):
+            with self.assertRaises(ValueError):
+                unifi.normalize_fingerprint(bad)
+        self.assertTrue(unifi.cert_matches(b"x", hashlib.sha256(b"x").hexdigest()))
+        self.assertFalse(unifi.cert_matches(b"y", hashlib.sha256(b"x").hexdigest()))
+
+
+class PlainErrorTests(unittest.TestCase):
+    """S8/S9: people see plain sentences; details stay in the server log."""
+
+    def test_unifi_errors_are_plain(self):
+        mock, srv, eng = build()
+        try:
+            mock.fail = True
+            with self.assertLogs("doorcontrol", "WARNING") as logs:
+                with self.assertRaises(UnifiError) as e:
+                    eng.client.doors()
+            self.assertEqual(
+                str(e.exception),
+                "The UniFi door controller refused the request (HTTP 500).",
+            )
+            self.assertIn("CODE_SYSTEM_ERROR", "\n".join(logs.output))
+        finally:
+            srv.shutdown()
+        c = UnifiClient("http://127.0.0.1:1", "t", timeout=1)
+        with self.assertLogs("doorcontrol", "WARNING"):
+            with self.assertRaises(UnifiError) as e:
+                c.doors()
+        self.assertEqual(str(e.exception), "Cannot reach the UniFi door controller.")
+
+    def test_calendar_error_is_plain(self):
+        cal = ical.Calendar({"ical_url": "https://secret.example/abc.ics"}, TZ)
+
+        def boom():
+            raise OSError("failed https://secret.example/abc.ics")
+
+        class Once(threading.Event):
+            def wait(self, t=None):
+                self.set()
+
+        cal.fetch_once = boom
+        cal._stop = Once()
+        with self.assertLogs("doorcontrol", "WARNING"):
+            cal._loop()
+        self.assertNotIn("secret", cal.last_error)
+        self.assertTrue(cal.last_error.endswith("."))
+
+    def test_calendar_url_must_be_https_and_feed_capped(self):
+        with self.assertRaises(ValueError) as e:
+            ical.check_url("http://calendar.google.com/x.ics")
+        self.assertIn("https://", str(e.exception))
+        ical.check_url("https://calendar.google.com/x.ics")
+        ical.check_url("")
+
+        class Big(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = b"x" * (ical.MAX_FEED_BYTES + 1)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass  # the reader stops at the cap
+
+        srv = HTTPServer(("127.0.0.1", 0), Big)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cal = ical.Calendar(
+                {"ical_url": "http://127.0.0.1:%d/" % srv.server_address[1]}, TZ
+            )
+            with self.assertRaises(ValueError):
+                cal.fetch_once()
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

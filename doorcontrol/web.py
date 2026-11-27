@@ -9,6 +9,7 @@ The scheduler and the Telegram bot never depend on anything in this module.
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -57,6 +58,12 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
 }
 SERVER_ERROR = "The request could not be completed. Nothing was changed."
+# Only these TCP peers may vouch for a request through CF-Connecting-IP and the public Host:
+# loopback, and Docker's private range where the host's cloudflared connection appears
+# (the compose network gateway, e.g. 172.18.0.1). Wrong value = public sign-in refused,
+# never open. X-Forwarded-* headers are ignored.
+DEFAULT_TRUSTED_PROXIES = "127.0.0.1/32,::1/128,172.16.0.0/12"
+MAX_CONNECTIONS = 64
 
 # Every route that needs a session: (method, path pattern, handler). Routing goes only
 # through this table, so a new route cannot skip the sign-in check.
@@ -109,11 +116,105 @@ def load_secret(data_dir):
     return p.read_bytes()
 
 
-def make_server(engine, data_dir, bind="0.0.0.0", port=8480):
+def proxy_list(value):
+    """'127.0.0.1, 172.16.0.0/12' -> networks. A bad entry stops the app (fail closed)."""
+    nets = []
+    for item in str(value or "").split(","):
+        if item.strip():
+            try:
+                nets.append(ipaddress.ip_network(item.strip(), strict=False))
+            except ValueError:
+                raise SystemExit(
+                    "TRUSTED_PROXIES: %r is not an IP address or range." % item
+                )
+    return nets
+
+
+def peer_in(address, networks):
+    try:
+        a = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return any(a.version == n.version and a in n for n in networks)
+
+
+class FailureLimiter:
+    """Break-glass failures: at most `per_address` per address and `overall` in total per
+    window (15 minutes). Old entries are pruned on every call, so memory stays bounded.
+    """
+
+    def __init__(self, per_address=10, overall=50, window=900):
+        self.per_address, self.overall, self.window = per_address, overall, window
+        self.by_address = {}
+        self.lock = threading.Lock()
+
+    def _prune(self, now):
+        for ip in list(self.by_address):
+            kept = [t for t in self.by_address[ip] if now - t < self.window]
+            if kept:
+                self.by_address[ip] = kept
+            else:
+                del self.by_address[ip]
+
+    def total(self):
+        return sum(len(v) for v in self.by_address.values())
+
+    def allowed(self, ip):
+        with self.lock:
+            self._prune(time.time())
+            return (
+                len(self.by_address.get(ip, ())) < self.per_address
+                and self.total() < self.overall
+            )
+
+    def failed(self, ip):
+        with self.lock:
+            now = time.time()
+            self._prune(now)
+            if self.total() < self.overall:
+                self.by_address.setdefault(ip, []).append(now)
+
+
+class Server(ThreadingHTTPServer):
+    """At most `max_connections` requests at once; extra connections are closed at once."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_connections=MAX_CONNECTIONS):
+        super().__init__(address, handler)
+        self.max_connections = max_connections
+        self._slots = threading.BoundedSemaphore(max_connections)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def make_server(
+    engine, data_dir, bind="0.0.0.0", port=8480, max_connections=MAX_CONNECTIONS
+):
     os.makedirs(data_dir, exist_ok=True)
     google_signin.DAYS = auth.DAYS = SESSION_DAYS
     secret = load_secret(data_dir)
-    httpd = ThreadingHTTPServer((bind, int(port)), Handler)
+    httpd = Server((bind, int(port)), Handler, max_connections)
+    httpd.trusted_proxies = proxy_list(
+        os.environ.get("TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES)
+    )
+    httpd.limiter = FailureLimiter()
     httpd.engine = engine
     httpd.secret = secret
     httpd.auth = auth.Auth(data_dir, secret, AUTH_COOKIE)
@@ -129,6 +230,7 @@ def make_server(engine, data_dir, bind="0.0.0.0", port=8480):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "DoorControl"
+    timeout = 30  # seconds a connection may sit idle or half-sent
 
     def log_message(self, fmt, *args):
         log.debug("web: " + fmt, *args)
@@ -176,11 +278,22 @@ class Handler(BaseHTTPRequestHandler):
     def sign(self, v):
         return hmac.new(self.server.secret, v.encode(), hashlib.sha256).hexdigest()
 
+    def from_proxy(self):
+        return peer_in(self.client_address[0], self.server.trusted_proxies)
+
     def ip(self):
-        return self.headers.get("CF-Connecting-IP") or self.client_address[0]
+        """The person's address: CF-Connecting-IP only when a trusted proxy sent it."""
+        if self.from_proxy():
+            return self.headers.get("CF-Connecting-IP") or self.client_address[0]
+        return self.client_address[0]
 
     def body(self, limit=65536):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("Invalid request length.")
+        if n < 0:
+            raise ValueError("Invalid request length.")
         if n > limit:
             raise ValueError("Request too large.")
         b = json.loads(self.rfile.read(n) or b"{}")
@@ -228,6 +341,47 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.dispatch("DELETE")
 
+    def not_allowed(self, head=False):
+        body = json.dumps({"error": "This kind of request is not supported."}).encode()
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Allow", "GET, POST, PUT, DELETE")
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        self.not_allowed(head=True)
+
+    def do_PATCH(self):
+        self.not_allowed()
+
+    def do_OPTIONS(self):
+        self.not_allowed()
+
+    def send_error(self, code, message=None, explain=None):
+        """Malformed or unsupported requests: a plain JSON sentence, with the security headers."""
+        self.close_connection = True
+        text = {
+            400: "The request could not be read.",
+            408: "The request took too long.",
+            414: "The address is too long.",
+            431: "The request headers are too large.",
+            501: "This kind of request is not supported.",
+        }.get(code, "The request could not be handled.")
+        body = json.dumps({"error": text}).encode()
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD" and code >= 200 and code not in (204, 304):
+                self.wfile.write(body)
+        except OSError:
+            pass
+
     def dispatch(self, method):
         self.user = None
         try:
@@ -255,20 +409,22 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlsplit(self.path)
         path = urllib.parse.unquote(u.path)
         q = urllib.parse.parse_qs(u.query)
-        cloudflare = bool(self.headers.get("CF-Connecting-IP"))
+        # Headers that claim Cloudflare count only from a trusted proxy (TRUSTED_PROXIES).
+        proxy = self.from_proxy()
+        cloudflare = proxy and bool(self.headers.get("CF-Connecting-IP"))
 
         # Docker's health check comes from inside the container: no Host rules, no sign-in.
         if path == "/health":
             if (
                 method == "GET"
                 and is_loopback(self.client_address[0])
-                and not cloudflare
+                and not self.headers.get("CF-Connecting-IP")
             ):
                 return self.send(200, {"ok": True, "version": VERSION})
             raise LookupError("Not found.")
 
         public = self.server.public_hosts
-        self.remote = host in public or cloudflare
+        self.remote = proxy and (host in public or cloudflare)
         if self.remote:
             # Anything that came through Cloudflare must use the public hostname.
             if host not in public:
@@ -293,10 +449,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- the gate ----
         cookie = self.jar(AUTH_COOKIE)
+        admin = self.server.auth.verify(cookie) if cookie else None
+        # Break-glass sessions are shown and logged as "admin:NAME", never like an email.
         self.user = (
-            self.server.auth.verify(cookie) or self.server.google.verify(cookie)
-            if cookie
-            else None
+            "admin:" + admin
+            if admin
+            else (self.server.google.verify(cookie) if cookie else None)
         )
         if not self.user:
             if method == "GET" and path in ("/", "/index.html"):
@@ -378,21 +536,25 @@ class Handler(BaseHTTPRequestHandler):
         self.same_origin()
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             raise ValueError("Use a JSON request.")
+        ip = self.ip()
+        limiter = self.server.limiter
+        if not limiter.allowed(ip):
+            log.warning("admin sign-in refused: too many failures (%s)", ip)
+            raise TooManyTries()
         if not self.remote:
+            limiter.failed(ip)
+            log.warning("admin sign-in refused: not the public address (%s)", ip)
             raise PermissionError("Admin sign-in works only at the internet address.")
         b = self.body(4000)
-        ip = self.ip()
         a = self.server.auth
-        if not a.allowed(ip):
-            raise TooManyTries()
         name = a.check(b.get("name"), b.get("password")) if a.load() else None
         if not name:
-            a.failed(ip)
+            limiter.failed(ip)
             log.warning("admin sign-in failed (%s)", ip)
             return self.send(401, {"error": "Wrong name or password."})
-        log.info("admin sign-in: %s (%s)", name, ip)
+        log.info("admin sign-in: admin:%s (%s)", name, ip)
         self.engine.db.log(
-            "", "sign-in", "web", True, "signed in (password)", user=name
+            "", "sign-in", "web", True, "signed in (password)", user="admin:" + name
         )
         return self.send(
             200, {"ok": True}, extra={"Set-Cookie": a.cookie_header(a.issue(name))}
@@ -496,7 +658,11 @@ class Handler(BaseHTTPRequestHandler):
             200,
             {
                 "scheduler_last_tick": e.last_tick,
-                "scheduler_error": e.last_error,
+                "scheduler_error": (
+                    "The scheduler hit an error. See the server log."
+                    if e.last_error
+                    else None
+                ),
                 "calendar_enabled": bool(cal and cal.url),
                 "calendar_last_ok": cal.last_ok if cal else None,
                 "calendar_error": cal.last_error if cal else None,

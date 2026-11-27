@@ -12,4 +12,10 @@ First numbered release.
 - Security: strict CSP and security headers on every response, CSRF token on every change, Cloudflare
   traffic for other hostnames refused, plain error messages.
 - Code formatted with black and prettier; JS and CSS moved out of `index.html`.
+- Review round 1: Cloudflare headers and the public hostname count only from `TRUSTED_PROXIES`;
+  break-glass failures capped at 10 per address and 50 in total per 15 minutes; bad Content-Length
+  refused; 30-second connection timeout and at most 64 connections; optional `unifi.cert_sha256`
+  certificate pinning; plain error sentences (details in the server log); calendar feed must be https://
+  and at most 5 MB; container drops all capabilities with pid and memory limits; admin sign-ins shown as
+  `admin:NAME`; deploy block restores the old service on every failure.
 - `web.password`, `web.bind`, `web.port` and `db_path` removed from `config.json` (ignored with a warning).

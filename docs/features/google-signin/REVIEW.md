@@ -5,18 +5,18 @@ Tests at review time: test_all 16, test_google 41, test_ui 12 (all pass). Q1 is 
 
 | ID | Level | Where | Finding | Status |
 |----|-------|-------|---------|--------|
-| S1/Q1 | BLOCKER | web.py ip(), remote-mode check; compose.yaml ports | `CF-Connecting-IP` and `Host` are trusted from any client. A LAN client can rotate a fake header to bypass the 10-per-15-min break-glass limit (AC17) and grow `_fails` without bound. | open |
-| S2 | SHOULD-FIX | web.py `_body` | Negative `Content-Length` reaches `rfile.read(-1)` on `/api/login` without sign-in. | open |
-| S3 | SHOULD-FIX | unifi.py, config | UniFi connection does not verify the console certificate (token capture on the LAN). | open |
-| S4 | SHOULD-FIX | web.py server | No socket timeout or connection cap. | open |
-| C1 | SHOULD-FIX | CLAUDE.md first-move block | `exit 1` does not fire the ERR trap, so the rollback never runs and the old service stays stopped. | open |
-| S6 | NIT | web.py log | Break-glass account names can look like a staff email in the log. | open (cheap, include) |
-| S8 | NIT | unifi.py, web.py | Raw UniFi / calendar error text shown to signed-in users. | open (cheap, include) |
-| S9 | NIT | ical.py | Calendar feed read unbounded; http:// accepted. | open (cheap, include) |
-| S10 | NIT | compose.yaml | No cap_drop / pids / memory limit. | open (cheap, include) |
-| C2 | NIT | CLAUDE.md backup step | WAL/SHM files not copied if the old DB is in WAL mode. | open (cheap, include) |
-| C4 | NIT | compose.yaml, blocks | `door-control:1.0.0` hardcoded in deploy/rollback blocks. | open (cheap, include) |
-| Q2 | NIT | web.py | PATCH/HEAD/OPTIONS return Python's default 501 HTML. | open (cheap, include) |
+| S1/Q1 | BLOCKER | web.py ip(), remote-mode check; compose.yaml ports | `CF-Connecting-IP` and `Host` are trusted from any client. A LAN client can rotate a fake header to bypass the 10-per-15-min break-glass limit (AC17) and grow `_fails` without bound. | fixed: TRUSTED_PROXIES (default loopback + 172.16.0.0/12), own FailureLimiter (10/address, 50 overall, pruned); tests TrustTests |
+| S2 | SHOULD-FIX | web.py `_body` | Negative `Content-Length` reaches `rfile.read(-1)` on `/api/login` without sign-in. | fixed: negative/non-numeric Content-Length -> 400; test_bad_content_length_is_400 |
+| S3 | SHOULD-FIX | unifi.py, config | UniFi connection does not verify the console certificate (token capture on the LAN). | fixed: optional unifi.cert_sha256 checked before the request is sent; startup warning when unset; UnifiTlsTests (mock over HTTPS) |
+| S4 | SHOULD-FIX | web.py server | No socket timeout or connection cap. | fixed: Handler.timeout 30 s, max 64 connections (extra closed at once); tests |
+| C1 | SHOULD-FIX | CLAUDE.md first-move block | `exit 1` does not fire the ERR trap, so the rollback never runs and the old service stays stopped. | fixed: set -eE, restore_old() called by the ERR trap and explicitly on every exit path, plus a 90 s health check; test |
+| S6 | NIT | web.py log | Break-glass account names can look like a staff email in the log. | fixed: admin:NAME in header and log |
+| S8 | NIT | unifi.py, web.py | Raw UniFi / calendar error text shown to signed-in users. | fixed: plain UniFi/calendar/scheduler sentences, details to server log |
+| S9 | NIT | ical.py | Calendar feed read unbounded; http:// accepted. | fixed: https:// required at startup (config message), 5 MB cap |
+| S10 | NIT | compose.yaml | No cap_drop / pids / memory limit. | fixed: cap_drop ALL, pids_limit 128, mem_limit 256m |
+| C2 | NIT | CLAUDE.md backup step | WAL/SHM files not copied if the old DB is in WAL mode. | fixed: SQLite backup API in the move, rollback and backup blocks |
+| C4 | NIT | compose.yaml, blocks | `door-control:1.0.0` hardcoded in deploy/rollback blocks. | fixed: docker compose run instead of the image tag; test |
+| Q2 | NIT | web.py | PATCH/HEAD/OPTIONS return Python's default 501 HTML. | fixed: 405 JSON for PATCH/OPTIONS/HEAD, JSON send_error for the rest |
 | S5 | NIT | auth.py | `set_password` accepts 10 chars (spec says 12); only manage.py enforces 12. No web route sets passwords. | not fixed: shared copy pinned to Awards; follow-up |
 | S7 | NIT | google_signin.py | No PKCE; state cookie not cleared after callback. | not fixed: shared copy pinned to Awards; follow-up for all apps |
 | C3 | NIT | *.md | `prettier --check .` flags Markdown (AC26 covers JS/CSS/HTML only). | not fixed |

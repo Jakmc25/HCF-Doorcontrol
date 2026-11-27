@@ -68,12 +68,47 @@ Setting a new password signs that account out everywhere.
 
 | Where | What |
 |---|---|
-| `.env` next to `compose.yaml` (git-ignored, mode 600) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (leave empty), `PUBLIC_HOSTS=doors.jakemc.me`, `ALLOWED_HOSTS` (fair-network addresses; empty refuses them all). See `.env.example`. |
-| `/data/config.json` in the `door_control_data` volume (mode 600) | UniFi host and API token, Telegram bot token and allowed chat IDs, Google Calendar secret iCal URL, time zone, default unlock minutes. See `config.example.json`. |
+| `.env` next to `compose.yaml` (git-ignored, mode 600) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (leave empty), `PUBLIC_HOSTS=doors.jakemc.me`, `ALLOWED_HOSTS` (fair-network addresses; empty refuses them all), optional `TRUSTED_PROXIES` (see below). See `.env.example`. |
+| `/data/config.json` in the `door_control_data` volume (mode 600) | UniFi host, API token and optional `cert_sha256`, Telegram bot token and allowed chat IDs, Google Calendar secret iCal URL, time zone, default unlock minutes. See `config.example.json`. |
 | `/data/doorcontrol.db`, `/data/session-secret`, `/data/accounts.json` | Schedules, door state and activity log; session signing key; break-glass account. |
 
 Changing `GOOGLE_ALLOWED_DOMAINS` or `GOOGLE_ALLOWED_EMAILS` and restarting signs out every Google
 session made under the old rule.
+
+### Trusted proxies (TRUSTED_PROXIES in .env)
+
+Door Control believes the `CF-Connecting-IP` header and the doors.jakemc.me hostname only when the
+connection comes from a trusted proxy (the Cloudflare tunnel's `cloudflared` on fair-server). Anyone
+else who sends those headers is treated as an ordinary fair-network visitor. The default,
+`127.0.0.1/32,::1/128,172.16.0.0/12`, covers loopback and Docker's private range, which is where
+`cloudflared` running on fair-server appears when it connects to `localhost:8480`.
+
+If the value is wrong, sign-in at doors.jakemc.me is refused with "Use the fair server address"; the
+app never opens up. To see the address the tunnel really uses, and to check that a fair-network
+computer is **not** trusted:
+
+```bash
+(cd /srv/fair-apps/door-control && docker network inspect door-control_default -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' && curl -s -o /dev/null -w "fair network as public host: %{http_code} (must be 403)\n" -H 'Host: doors.jakemc.me' http://192.168.1.160:8480/api/login-info)
+```
+
+The first line is the gateway address `cloudflared` appears from; it must be inside `TRUSTED_PROXIES`.
+To narrow the setting to that address, add `TRUSTED_PROXIES=127.0.0.1/32,<that address>/32` to `.env`
+and run `docker compose up -d`. If `cloudflared` runs in its own Docker container, use that
+container's network range instead.
+
+### Pin the UniFi console certificate (unifi.cert_sha256)
+
+The console uses a self-signed certificate. Pin it so nobody on the LAN can pretend to be the console
+and catch the API token. Print the fingerprint (from fair-server):
+
+```bash
+(openssl s_client -connect 192.168.1.1:12445 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256)
+```
+
+Copy the part after `=` into `"cert_sha256"` inside the `"unifi"` section of config.json (see "Change
+config.json"; colons are fine). When it is set and the certificate does not match, Door Control refuses
+to connect and the dashboard says so. When it is not set, the app works as before and prints one warning
+at startup. After a console certificate renewal, update the value.
 
 ### Change config.json
 

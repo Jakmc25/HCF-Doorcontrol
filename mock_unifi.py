@@ -43,7 +43,7 @@ class Mock:
         self.fail = False
 
 
-def make_server(mock, port=0):
+def make_server(mock, port=0, ssl_context=None):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -94,6 +94,8 @@ def make_server(mock, port=0):
             self._handle("PUT")
 
     srv = HTTPServer(("127.0.0.1", port), H)
+    if ssl_context:  # HTTPS like the real console (tests of certificate pinning)
+        srv.socket = ssl_context.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
