@@ -1,4 +1,5 @@
 """Web dashboard + JSON API (stdlib http.server, password via HTTP Basic auth)."""
+
 import base64
 import hmac
 import json
@@ -62,15 +63,21 @@ def make_server(cfg, engine):
             try:
                 if method == "GET" and path in ("/", "/index.html"):
                     with open(os.path.join(STATIC, "index.html"), "rb") as f:
-                        return self._send(200, ctype="text/html; charset=utf-8", raw=f.read())
+                        return self._send(
+                            200, ctype="text/html; charset=utf-8", raw=f.read()
+                        )
                 if method == "GET" and path == "/api/doors":
                     return self._send(200, engine.status())
                 m = re.fullmatch(r"/api/doors/([^/]+)/action", path)
                 if method == "POST" and m:
                     b = self._body()
                     door = engine.find_door(m.group(1))
-                    desc = engine.door_action(door, b.get("action"), b.get("minutes"), source="web")
-                    return self._send(200, {"ok": True, "message": "%s: %s" % (door["name"], desc)})
+                    desc = engine.door_action(
+                        door, b.get("action"), b.get("minutes"), source="web"
+                    )
+                    return self._send(
+                        200, {"ok": True, "message": "%s: %s" % (door["name"], desc)}
+                    )
                 if method == "GET" and path == "/api/schedules":
                     return self._send(200, engine.db.schedules())
                 if method == "POST" and path == "/api/schedules":
@@ -81,7 +88,9 @@ def make_server(cfg, engine):
                 if m:
                     sid = int(m.group(1))
                     if method == "PUT":
-                        if not engine.db.update_schedule(sid, validate_schedule(self._body())):
+                        if not engine.db.update_schedule(
+                            sid, validate_schedule(self._body())
+                        ):
                             return self._send(404, {"error": "No such schedule"})
                         self._tick_soon()
                         return self._send(200, {"ok": True})
@@ -95,16 +104,22 @@ def make_server(cfg, engine):
                 if method == "GET" and path == "/api/log":
                     rows = engine.db.recent_log(40)
                     for r in rows:
-                        r["time"] = datetime.fromtimestamp(r["ts"], engine.tz).strftime("%a %b %d %I:%M:%S %p")
+                        r["time"] = datetime.fromtimestamp(r["ts"], engine.tz).strftime(
+                            "%a %b %d %I:%M:%S %p"
+                        )
                     return self._send(200, rows)
                 if method == "GET" and path == "/api/health":
                     cal = engine.calendar
-                    return self._send(200, {
-                        "scheduler_last_tick": engine.last_tick, "scheduler_error": engine.last_error,
-                        "calendar_enabled": bool(cal and cal.url),
-                        "calendar_last_ok": cal.last_ok if cal else None,
-                        "calendar_error": cal.last_error if cal else None,
-                    })
+                    return self._send(
+                        200,
+                        {
+                            "scheduler_last_tick": engine.last_tick,
+                            "scheduler_error": engine.last_error,
+                            "calendar_enabled": bool(cal and cal.url),
+                            "calendar_last_ok": cal.last_ok if cal else None,
+                            "calendar_error": cal.last_error if cal else None,
+                        },
+                    )
                 return self._send(404, {"error": "Not found"})
             except DoorError as e:
                 self._send(404, {"error": str(e)})
@@ -118,6 +133,7 @@ def make_server(cfg, engine):
 
         def _tick_soon(self):
             import threading
+
             threading.Thread(target=lambda: self._safe_tick(), daemon=True).start()
 
         def _safe_tick(self):
@@ -138,4 +154,6 @@ def make_server(cfg, engine):
         def do_DELETE(self):
             self._route("DELETE")
 
-    return ThreadingHTTPServer((cfg.get("bind", "0.0.0.0"), int(cfg.get("port", 8480))), Handler)
+    return ThreadingHTTPServer(
+        (cfg.get("bind", "0.0.0.0"), int(cfg.get("port", 8480))), Handler
+    )

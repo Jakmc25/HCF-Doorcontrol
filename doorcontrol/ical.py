@@ -4,6 +4,7 @@ Supports timed and all-day events, TZID/UTC times, EXDATE, modified instances
 (RECURRENCE-ID) and the common RRULE forms (DAILY, WEEKLY+BYDAY, MONTHLY by
 day-of-month, YEARLY, with INTERVAL / COUNT / UNTIL).
 """
+
 import re
 import threading
 import time
@@ -38,7 +39,13 @@ def _prop(line):
 
 
 def _unescape(s):
-    return s.replace("\\n", "\n").replace("\\N", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+    return (
+        s.replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+    )
 
 
 def _parse_dt(value, params, tz):
@@ -83,7 +90,9 @@ def _parse_events(text, tz):
                 elif name == "STATUS":
                     cur["status"] = value.upper()
                 elif name == "RRULE":
-                    cur["rrule"] = dict(p.split("=", 1) for p in value.split(";") if "=" in p)
+                    cur["rrule"] = dict(
+                        p.split("=", 1) for p in value.split(";") if "=" in p
+                    )
                 elif name == "EXDATE":
                     for v in value.split(","):
                         cur["exdates"].append(_parse_dt(v, params, tz)[0])
@@ -111,7 +120,15 @@ def _rrule_occurrences(start, rule):
     tzinfo = start.tzinfo
 
     def at(d):
-        return datetime(d.year, d.month, d.day, start.hour, start.minute, start.second, tzinfo=tzinfo)
+        return datetime(
+            d.year,
+            d.month,
+            d.day,
+            start.hour,
+            start.minute,
+            start.second,
+            tzinfo=tzinfo,
+        )
 
     emitted = 0
 
@@ -122,7 +139,9 @@ def _rrule_occurrences(start, rule):
                 yield at(start.date() + timedelta(days=k * interval))
                 k += 1
         elif freq == "WEEKLY":
-            byday = sorted(DAYS[c[-2:]] for c in rule.get("BYDAY", "").split(",") if c[-2:] in DAYS) or [start.weekday()]
+            byday = sorted(
+                DAYS[c[-2:]] for c in rule.get("BYDAY", "").split(",") if c[-2:] in DAYS
+            ) or [start.weekday()]
             week0 = start.date() - timedelta(days=start.weekday())
             w = 0
             while True:
@@ -131,7 +150,11 @@ def _rrule_occurrences(start, rule):
                     yield at(base + timedelta(days=wd))
                 w += 1
         elif freq == "MONTHLY":
-            day = int(rule["BYMONTHDAY"].split(",")[0]) if "BYMONTHDAY" in rule else start.day
+            day = (
+                int(rule["BYMONTHDAY"].split(",")[0])
+                if "BYMONTHDAY" in rule
+                else start.day
+            )
             k = 0
             while True:
                 m = start.month - 1 + k * interval
@@ -165,7 +188,11 @@ def _rrule_occurrences(start, rule):
 
 def expand(events, first, last):
     """Return [{'title','start','end'}] overlapping [first, last]."""
-    overridden = {(e.get("uid"), e["recurrence_id"].astimezone(timezone.utc)) for e in events if "recurrence_id" in e}
+    overridden = {
+        (e.get("uid"), e["recurrence_id"].astimezone(timezone.utc))
+        for e in events
+        if "recurrence_id" in e
+    }
     out = []
     for e in events:
         if e.get("status") == "CANCELLED":
@@ -240,14 +267,18 @@ class Calendar:
             title = occ["title"].strip()
             if not title.casefold().startswith(self.prefix):
                 continue
-            rest = title[len(self.prefix):]
+            rest = title[len(self.prefix) :]
             names = [n.strip() for n in re.split(r",|&|\band\b", rest) if n.strip()]
             if not names:
                 continue
-            out.append({
-                "title": title,
-                "start": occ["start"] - self.before,
-                "end": occ["end"] + self.after,
-                "door_queries": ["*" if n.casefold() == "all" else n for n in names],
-            })
+            out.append(
+                {
+                    "title": title,
+                    "start": occ["start"] - self.before,
+                    "end": occ["end"] + self.after,
+                    "door_queries": [
+                        "*" if n.casefold() == "all" else n for n in names
+                    ],
+                }
+            )
         return out

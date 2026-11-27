@@ -1,4 +1,5 @@
 """Minimal client for the UniFi Access local Open API (port 12445)."""
+
 import json
 import ssl
 import urllib.error
@@ -17,7 +18,11 @@ class UnifiClient:
         self.ctx = None
         if self.host.startswith("https"):
             # The console uses a self-signed certificate by default.
-            self.ctx = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
+            self.ctx = (
+                ssl.create_default_context()
+                if verify_tls
+                else ssl._create_unverified_context()
+            )
 
     def _req(self, method, path, body=None):
         data = json.dumps(body).encode() if body is not None else None
@@ -32,7 +37,9 @@ class UnifiClient:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self.ctx) as r:
+            with urllib.request.urlopen(
+                req, timeout=self.timeout, context=self.ctx
+            ) as r:
                 raw = r.read()
         except urllib.error.HTTPError as e:
             detail = e.read()[:200].decode("utf-8", "replace")
@@ -44,7 +51,9 @@ class UnifiClient:
         except ValueError:
             raise UnifiError("UniFi returned invalid JSON")
         if payload.get("code") not in (None, "SUCCESS"):
-            raise UnifiError("UniFi error %s: %s" % (payload.get("code"), payload.get("msg")))
+            raise UnifiError(
+                "UniFi error %s: %s" % (payload.get("code"), payload.get("msg"))
+            )
         return payload.get("data")
 
     def doors(self):
@@ -61,4 +70,8 @@ class UnifiClient:
 
     def unlock(self, door_id):
         """Momentary remote unlock (same as pressing the unlock button)."""
-        return self._req("PUT", "/api/v1/developer/doors/%s/unlock" % door_id, {"actor_name": "Door Control"})
+        return self._req(
+            "PUT",
+            "/api/v1/developer/doors/%s/unlock" % door_id,
+            {"actor_name": "Door Control"},
+        )

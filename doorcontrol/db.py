@@ -54,15 +54,25 @@ class DB:
 
     def get_schedule(self, sid):
         with self.lock:
-            r = self.conn.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+            r = self.conn.execute(
+                "SELECT * FROM schedules WHERE id=?", (sid,)
+            ).fetchone()
         return self._sched(r) if r else None
 
     def add_schedule(self, s):
         with self.lock:
             cur = self.conn.execute(
                 "INSERT INTO schedules(name,doors,days,date,start,end,end_action,enabled) VALUES(?,?,?,?,?,?,?,?)",
-                (s["name"], json.dumps(s["doors"]), json.dumps(s["days"]) if s["days"] else None,
-                 s["date"], s["start"], s["end"], s["end_action"], 1 if s["enabled"] else 0),
+                (
+                    s["name"],
+                    json.dumps(s["doors"]),
+                    json.dumps(s["days"]) if s["days"] else None,
+                    s["date"],
+                    s["start"],
+                    s["end"],
+                    s["end_action"],
+                    1 if s["enabled"] else 0,
+                ),
             )
             self.conn.commit()
             return cur.lastrowid
@@ -71,8 +81,17 @@ class DB:
         with self.lock:
             cur = self.conn.execute(
                 "UPDATE schedules SET name=?,doors=?,days=?,date=?,start=?,end=?,end_action=?,enabled=? WHERE id=?",
-                (s["name"], json.dumps(s["doors"]), json.dumps(s["days"]) if s["days"] else None,
-                 s["date"], s["start"], s["end"], s["end_action"], 1 if s["enabled"] else 0, sid),
+                (
+                    s["name"],
+                    json.dumps(s["doors"]),
+                    json.dumps(s["days"]) if s["days"] else None,
+                    s["date"],
+                    s["start"],
+                    s["end"],
+                    s["end_action"],
+                    1 if s["enabled"] else 0,
+                    sid,
+                ),
             )
             self.conn.commit()
             return cur.rowcount > 0
@@ -86,7 +105,9 @@ class DB:
     # ---- per-door state the scheduler has applied ----
     def get_state(self, door_id):
         with self.lock:
-            r = self.conn.execute("SELECT * FROM door_state WHERE door_id=?", (door_id,)).fetchone()
+            r = self.conn.execute(
+                "SELECT * FROM door_state WHERE door_id=?", (door_id,)
+            ).fetchone()
         return dict(r) if r else None
 
     def set_state(self, door_id, applied, end_action=None, reason=None):
@@ -104,10 +125,14 @@ class DB:
                 "INSERT INTO log(ts,door,action,source,ok,detail) VALUES(?,?,?,?,?,?)",
                 (time.time(), door, action, source, 1 if ok else 0, detail),
             )
-            self.conn.execute("DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - 1000")
+            self.conn.execute(
+                "DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - 1000"
+            )
             self.conn.commit()
 
     def recent_log(self, n=40):
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM log ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM log ORDER BY id DESC LIMIT ?", (n,)
+            ).fetchall()
         return [dict(r) for r in rows]

@@ -17,7 +17,9 @@ def main(argv=None):
     path = argv[0] if argv else os.environ.get("DOORCONTROL_CONFIG", "config.json")
     with open(path) as f:
         cfg = json.load(f)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     log = logging.getLogger("doorcontrol")
 
     web_cfg = cfg.get("web", {})
@@ -41,7 +43,11 @@ def main(argv=None):
     Bot(cfg.get("telegram", {}), engine).start()
 
     server = make_server(web_cfg, engine)
-    log.info("Door Control running on http://%s:%s", web_cfg.get("bind", "0.0.0.0"), web_cfg.get("port", 8480))
+    log.info(
+        "Door Control running on http://%s:%s",
+        web_cfg.get("bind", "0.0.0.0"),
+        web_cfg.get("port", 8480),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
