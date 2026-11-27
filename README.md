@@ -46,6 +46,17 @@ Create a **new** bot with @BotFather (don't reuse FairSync's token; two programs
 Put its token in `telegram.token`, restart, message the bot: it replies with your chat ID.
 Add that to `allowed_chat_ids`, restart. Try `/help`.
 
+## Using it away from the fairgrounds
+Never port-forward the dashboard to the internet: it controls door locks and uses a single shared password.
+Use one of these instead:
+
+- **Telegram bot** (section 4): works from anywhere with no network setup, since the server only makes outbound calls.
+- **Tailscale** (free for personal use): install it on the fair server and on your phone/laptop, sign in to the same account, then
+  open `http://<server-tailscale-name>:8480`. Traffic is encrypted end to end and nothing is exposed publicly.
+  For a proper https address, set `web.bind` to `127.0.0.1` and run `sudo tailscale serve --bg 8480`; it prints a
+  `https://<name>.<tailnet>.ts.net` URL that only your devices can reach. Share the tailnet with anyone else who needs access
+  (e.g. via Tailscale's invite feature); each person still needs the dashboard password.
+
 ## Notes and limits
 - Lock rules need a UniFi Access hub that supports them (API v1.24.6+). `Lock now` uses `lock_now`.
 - "Unlock for…" is capped at 8 hours (UniFi custom rule); use a schedule or "Keep unlocked" for longer.
