@@ -307,6 +307,7 @@ class WebTests(unittest.TestCase):
             "ALLOWED_HOSTS": "",
             "GOOGLE_ALLOWED_DOMAINS": "hardincountyfair.org",
             "GOOGLE_ALLOWED_EMAILS": "",
+            "TRUSTED_PROXIES": "127.0.0.1/32",  # the test client plays cloudflared
         }
         with mock.patch.dict(os.environ, env):
             self.web = make_server(self.eng, tempfile.mkdtemp(), "127.0.0.1", 0)

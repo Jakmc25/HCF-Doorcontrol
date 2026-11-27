@@ -48,6 +48,8 @@ ENV = {
     "GOOGLE_CLIENT_SECRET": "shh",
     "GOOGLE_ALLOWED_DOMAINS": "hardincountyfair.org",
     "GOOGLE_ALLOWED_EMAILS": "",
+    # The test client connects from loopback and plays cloudflared (the trusted proxy).
+    "TRUSTED_PROXIES": "127.0.0.1/32",
 }
 JAKE = "jake@hardincountyfair.org"
 PASSWORD = "correct horse battery staple"
@@ -1204,21 +1206,35 @@ class TrustTests(Base):
         self.assertLessEqual(lim.total(), 50, "bounded by the overall cap")
 
     def test_proxy_list(self):
+        self.assertEqual(web.DEFAULT_TRUSTED_PROXIES, "172.31.248.1/32")
         nets = web.proxy_list(web.DEFAULT_TRUSTED_PROXIES)
         for addr, ok in (
-            ("127.0.0.1", True),
-            ("::1", True),
-            ("::ffff:127.0.0.1", True),
-            ("172.18.0.1", True),
-            ("172.17.0.1", True),
-            ("192.168.1.50", False),
-            ("10.0.0.1", False),
+            ("172.31.248.1", True),  # door-control-net gateway: cloudflared on the host
+            ("172.31.248.2", False),  # the app's own container address
+            ("172.17.0.1", False),  # default bridge gateway
+            ("172.18.0.5", False),  # another fair app's container
+            ("127.0.0.1", False),  # loopback is not trusted by default
+            ("::1", False),
+            ("192.168.1.50", False),  # fair-network PC
             ("nonsense", False),
         ):
             self.assertEqual(web.peer_in(addr, nets), ok, addr)
+        lo = web.proxy_list("127.0.0.1/32")
+        self.assertTrue(web.peer_in("::ffff:127.0.0.1", lo))
         with self.assertRaises(SystemExit):
             web.proxy_list("not-an-ip")
         self.assertEqual(web.proxy_list(""), [])
+
+    def test_default_does_not_trust_other_peers(self):
+        st = Stack({"TRUSTED_PROXIES": web.DEFAULT_TRUSTED_PROXIES})
+        self.addCleanup(st.close)
+        cf = {"CF-Connecting-IP": "203.0.113.9"}
+        self.assertEqual(
+            st.call("GET", "/api/login-info", HOST, headers=cf).status, 403
+        )
+        self.assertFalse(
+            st.call("GET", "/api/login-info", LAN, headers=cf).json()["remote"]
+        )
 
 
 class RequestLimitTests(Base):
@@ -1472,6 +1488,34 @@ class RepoTests(unittest.TestCase):
         self.assertIn(
             "sqlite3", block, "database copied with SQLite's backup (WAL safe)"
         )
+
+    def test_compose_network_matches_trusted_proxy(self):
+        compose = read("compose.yaml")
+        self.assertIn("name: door-control-net", compose)
+        self.assertIn("subnet: 172.31.248.0/29", compose)
+        self.assertIn("gateway: 172.31.248.1\n", compose)
+        self.assertIn("${TRUSTED_PROXIES:-%s}" % web.DEFAULT_TRUSTED_PROXIES, compose)
+        self.assertIn('"0.0.0.0:8480:8480"', compose)
+        for name in ("README.md", "CLAUDE.md"):
+            self.assertIn("door-control-net", read(name))
+            self.assertNotIn("172.16.0.0/12", read(name))
+        self.assertIn("127.0.0.1:8480:8480", read("README.md"), "optional hardening")
+        self.assertIn("docker network inspect", read("README.md"))
+
+    def test_deploy_steps_pin_the_unifi_certificate(self):
+        claude = read("CLAUDE.md")
+        block = claude.split("### First move")[1].split("```bash\n")[1].split("```")[0]
+        self.assertIn("openssl s_client", block)
+        self.assertIn('c["unifi"]["cert_sha256"]', block)
+        # Read before the old service stops, so a failure changes nothing.
+        self.assertLess(block.index("openssl"), block.index("systemctl stop"))
+        self.assertIn("cert_sha256 is not set", claude.split("after a PR merges")[1])
+        readme = read("README.md")
+        pin = readme.split("### Pin the UniFi console certificate")[1].split(
+            "```bash\n"
+        )[1]
+        self.assertIn("openssl s_client", pin)
+        self.assertIn('["unifi"]["host"]', pin, "console address read from config.json")
 
 
 if __name__ == "__main__":

@@ -58,11 +58,13 @@ SECURITY_HEADERS = {
     "Cache-Control": "no-store",
 }
 SERVER_ERROR = "The request could not be completed. Nothing was changed."
-# Only these TCP peers may vouch for a request through CF-Connecting-IP and the public Host:
-# loopback, and Docker's private range where the host's cloudflared connection appears
-# (the compose network gateway, e.g. 172.18.0.1). Wrong value = public sign-in refused,
-# never open. X-Forwarded-* headers are ignored.
-DEFAULT_TRUSTED_PROXIES = "127.0.0.1/32,::1/128,172.16.0.0/12"
+# Only these TCP peers may vouch for a request through CF-Connecting-IP and the public Host.
+# Default: the gateway of the app's own compose network (door-control-net, 172.31.248.0/29),
+# which is where cloudflared on fair-server appears when it connects to localhost:8480.
+# Other containers (other fair apps) are on other networks and are not trusted. Loopback is
+# left out: inside the container only Docker's health check uses it, and /health needs no
+# trust. Wrong value = public sign-in refused, never open. X-Forwarded-* headers are ignored.
+DEFAULT_TRUSTED_PROXIES = "172.31.248.1/32"
 MAX_CONNECTIONS = 64
 
 # Every route that needs a session: (method, path pattern, handler). Routing goes only

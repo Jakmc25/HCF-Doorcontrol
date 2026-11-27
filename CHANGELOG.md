@@ -12,6 +12,9 @@ First numbered release.
 - Security: strict CSP and security headers on every response, CSRF token on every change, Cloudflare
   traffic for other hostnames refused, plain error messages.
 - Code formatted with black and prettier; JS and CSS moved out of `index.html`.
+- Review round 2: the app gets its own Docker network `door-control-net` (172.31.248.0/29) and only
+  its gateway (172.31.248.1, where cloudflared on fair-server appears) is trusted; deploy steps pin the
+  UniFi console certificate.
 - Review round 1: Cloudflare headers and the public hostname count only from `TRUSTED_PROXIES`;
   break-glass failures capped at 10 per address and 50 in total per 15 minutes; bad Content-Length
   refused; 30-second connection timeout and at most 64 connections; optional `unifi.cert_sha256`

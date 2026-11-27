@@ -19,7 +19,7 @@ fair-logo.png), `manage.py` (break-glass admin accounts), `mock_unifi.py` (fake 
 
 ## Commands
 Run locally against the fake controller: `python3 mock_unifi.py 12445`, then
-`PUBLIC_HOSTS=localhost:8480 ALLOWED_HOSTS=localhost:8480 python3 run.py config.json`
+`PUBLIC_HOSTS=localhost:8480 ALLOWED_HOSTS=localhost:8480 TRUSTED_PROXIES=127.0.0.1/32 python3 run.py config.json`
 (config: unifi.host `http://127.0.0.1:12445`, token `test-token`; data in `data/`; sign in with a local
 `python3 manage.py set-password admin`).
 Run tests (Docker, as on fair-server):
@@ -75,16 +75,20 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (empty),
   `PUBLIC_HOSTS=doors.jakemc.me`,
   `ALLOWED_HOSTS=192.168.1.160:8480,fair-server:8480,localhost:8480,127.0.0.1:8480` (empty = refuse every
-  fair-network address), optional `TRUSTED_PROXIES` (default `127.0.0.1/32,::1/128,172.16.0.0/12`:
-  only these TCP peers may vouch for `CF-Connecting-IP` and the public Host; wrong value = public
-  sign-in refused, never open; README "Trusted proxies" shows how to check it). README step 3 has the
-  block that writes `.env`.
+  fair-network address), optional `TRUSTED_PROXIES` (default `172.31.248.1/32`, the gateway of the app's
+  own network `door-control-net` 172.31.248.0/29 in compose.yaml, where cloudflared on fair-server
+  appears; only that peer may vouch for `CF-Connecting-IP` and the public Host, so other fair-app
+  containers cannot; wrong value = public sign-in refused, never open; README "Trusted proxies" has the
+  checks and what to do if the subnet clashes). README step 3 has the block that writes `.env`.
 - `config.json` may set `unifi.cert_sha256` (console certificate fingerprint; README "Pin the UniFi
   console certificate"). Unset: not checked, one warning at startup.
 - Deploy (run by the person deploying, see People in .claude/standards/STANDARDS.md), after a PR merges:
   ```bash
-  (set -e; cd /srv/fair-apps/door-control && git checkout main && git pull --ff-only && docker compose up -d --build && docker compose ps)
+  (set -e; cd /srv/fair-apps/door-control && git checkout main && git pull --ff-only && docker compose up -d --build && docker compose ps && sleep 20 && if docker compose logs --tail=100 | grep -q "cert_sha256 is not set"; then echo "Next: pin the UniFi certificate with the block in README, 'Pin the UniFi console certificate'."; fi)
   ```
+  The deploy prints a reminder when the UniFi certificate is not pinned yet; then run the README block
+  "Pin the UniFi console certificate" (it reads the console address from config.json). Run it again
+  after the console's certificate is renewed.
 - Don't deploy within 15 minutes of a schedule or calendar window starting/ending, or during the fair.
 - Never run `docker compose down -v`. Never run the old `door-control` systemd service and the container
   together (both drive the doors and poll the bot).
@@ -92,8 +96,10 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   never root).
 
 ### First move from systemd to Docker (1.0.0, one time)
-Order: README step 2 (Google client) and step 3 (`.env`) -> this block -> break-glass account ->
-README step 4 (Cloudflare row) -> manual checks. Pull and build happen while the old service still runs;
+Order: README step 2 (Google client) and step 3 (`.env`) -> this block (it also pins the UniFi console
+certificate: it reads the console address from `unifi.host` in config.json, prints the fingerprint and
+saves it as `unifi.cert_sha256`; nothing to type in) -> break-glass account -> README step 4
+(Cloudflare row) -> README "Trusted proxies" checks -> manual checks. Pull and build happen while the old service still runs;
 the old dashboard page may not load during the build, the scheduler keeps working. Once the old service
 is stopped, every failure (a failed command, the old service still running, or a container that is not
 healthy within 90 seconds) runs `restore_old`: stop the container, check out the old commit and start the
@@ -107,6 +113,10 @@ test -e /srv/fair-apps/door-control-backups/pre-docker-commit || git rev-parse H
 git checkout main
 git pull --ff-only
 docker compose build
+CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); print("%s:%s" % (u.hostname, u.port or 443))' config.json)
+FP=$(openssl s_client -connect "$CONSOLE" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+if [ -z "$FP" ]; then echo "Stop: could not read the UniFi console certificate from $CONSOLE (nothing changed)."; exit 1; fi
+echo "UniFi console $CONSOLE certificate SHA-256: $FP"
 BK=/srv/fair-apps/door-control-backups/$(date +%Y%m%d-%H%M%S)
 mkdir -m 700 "$BK"
 restore_old() {
@@ -125,7 +135,7 @@ if systemctl is-active --quiet door-control; then echo "Stop: the old door-contr
 umask 077
 python3 -c 'import sqlite3,sys; s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()' data/doorcontrol.db "$BK/doorcontrol.db"
 cp -p config.json "$BK"/
-python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); c.pop("web",None); c.pop("db_path",None); json.dump(c,open(sys.argv[2],"w"),indent=2)' "$BK/config.json" "$BK/config.docker.json"
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); c.pop("web",None); c.pop("db_path",None); c["unifi"]["cert_sha256"]=sys.argv[3]; json.dump(c,open(sys.argv[2],"w"),indent=2)' "$BK/config.json" "$BK/config.docker.json" "$FP"
 docker compose run --rm -T --no-deps --user 0 -v "$BK":/src:ro app sh -c 'if [ -e /data/doorcontrol.db ]; then echo "The volume already has a database; not overwriting it."; exit 1; fi; cp /src/doorcontrol.db /data/doorcontrol.db && cp /src/config.docker.json /data/config.json && chown 10001:10001 /data /data/doorcontrol.db /data/config.json && chmod 600 /data/config.json /data/doorcontrol.db'
 docker compose up -d
 STATUS=starting
@@ -181,10 +191,10 @@ None open in this app. Follow-ups elsewhere: dev-standards APPS.md needs a Door 
 ## History
 - 2026-11 first version: scheduler, web dashboard (shared HTTP Basic password), Telegram bot, Google
   Calendar sync; systemd service.
-- 1.0.0 (2026-11-27, feature/google-signin, review round 1 fixed): Google sign-in (hardincountyfair.org) at doors.jakemc.me,
+- 1.0.0 (2026-11-27, feature/google-signin, review rounds 1-2 fixed): Google sign-in (hardincountyfair.org) at doors.jakemc.me,
   break-glass admin password, CSRF, host lockdown, who-did-it activity log (additive `log.user`),
   Docker Compose, CSP + static split, black/prettier, VERSION/CHANGELOG. Review round 1: trusted
-  proxies, overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
+  proxies (round 2: own network door-control-net, gateway /32 only), overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
 
 ## Team workflow
 - Standards: .claude/standards/ (synced from the dev-standards repo; don't edit here)

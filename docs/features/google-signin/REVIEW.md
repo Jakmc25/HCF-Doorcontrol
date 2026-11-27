@@ -1,7 +1,7 @@
 # Review: Google sign-in (round 1)
 
 Reviewers: code-reviewer (PASS, C1 should-fix), qa-tester (CHANGES REQUIRED, Q1), security-reviewer (CHANGES REQUIRED, S1).
-Tests at review time: test_all 16, test_google 41, test_ui 12 (all pass). Q1 is the same defect as S1.
+Tests at review time: test_all 16, test_google 41, test_ui 12 (all pass). Q1 is the same defect as S1. Round 2 re-check: Q1, C1, S1-S4 fixed; S11 and D1 added.
 
 | ID | Level | Where | Finding | Status |
 |----|-------|-------|---------|--------|
@@ -21,6 +21,8 @@ Tests at review time: test_all 16, test_google 41, test_ui 12 (all pass). Q1 is 
 | S7 | NIT | google_signin.py | No PKCE; state cookie not cleared after callback. | not fixed: shared copy pinned to Awards; follow-up for all apps |
 | C3 | NIT | *.md | `prettier --check .` flags Markdown (AC26 covers JS/CSS/HTML only). | not fixed |
 | C5 | NIT | .dockerignore | `.env.*` also excludes `.env.example`. | not fixed (harmless) |
+| S11 | SHOULD-FIX (round 2) | compose.yaml, web.py | Default TRUSTED_PROXIES 172.16.0.0/12 trusts every container on fair-server. | fixed: own network door-control-net 172.31.248.0/29, default TRUSTED_PROXIES 172.31.248.1/32 only (loopback dropped); README checks, subnet-clash steps, optional 127.0.0.1 publish; tests |
+| D1 | DOCS (round 2) | CLAUDE.md, README | Deploy steps should pin the UniFi certificate. | fixed: first-move block reads the fingerprint before stopping the old service and saves unifi.cert_sha256; routine deploy prints a reminder; README pin block; console address read from unifi.host |
 
 Checked and clean (QA/code/security): 401 on all /api routes and non-public static files; /static traversal; old Basic password refused;
 forged/missing CSRF and foreign Origin refused; tampered cookies refused; accounts.json mode 600; additive log.user migration on an old DB;

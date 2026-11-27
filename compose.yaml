@@ -15,7 +15,9 @@ services:
       GOOGLE_ALLOWED_EMAILS: ${GOOGLE_ALLOWED_EMAILS:-}
       PUBLIC_HOSTS: ${PUBLIC_HOSTS:-}
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
-      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1/32,::1/128,172.16.0.0/12}
+      # Only this network's gateway (where cloudflared on the host appears) may vouch for
+      # Cloudflare headers. See README "Trusted proxies".
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.31.248.1/32}
     # /data holds config.json (UniFi/Telegram tokens, calendar URL), doorcontrol.db,
     # session-secret and accounts.json. Never run "docker compose down -v".
     volumes:
@@ -29,6 +31,15 @@ services:
       - ALL
     pids_limit: 128
     mem_limit: 256m
+# A fixed, small network so the gateway address above never changes and no other
+# container shares it. If the subnet clashes with another Docker network, see README.
+networks:
+  default:
+    name: door-control-net
+    ipam:
+      config:
+        - subnet: 172.31.248.0/29
+          gateway: 172.31.248.1
 volumes:
   door_control_data:
     name: door_control_data

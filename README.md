@@ -78,37 +78,77 @@ session made under the old rule.
 ### Trusted proxies (TRUSTED_PROXIES in .env)
 
 Door Control believes the `CF-Connecting-IP` header and the doors.jakemc.me hostname only when the
-connection comes from a trusted proxy (the Cloudflare tunnel's `cloudflared` on fair-server). Anyone
-else who sends those headers is treated as an ordinary fair-network visitor. The default,
-`127.0.0.1/32,::1/128,172.16.0.0/12`, covers loopback and Docker's private range, which is where
-`cloudflared` running on fair-server appears when it connects to `localhost:8480`.
+connection comes from a trusted proxy: `cloudflared` (the Cloudflare tunnel) on fair-server. Anyone else
+who sends those headers is treated as an ordinary fair-network visitor.
 
-If the value is wrong, sign-in at doors.jakemc.me is refused with "Use the fair server address"; the
-app never opens up. To see the address the tunnel really uses, and to check that a fair-network
-computer is **not** trusted:
+The app runs on its own small Docker network, `door-control-net` (`172.31.248.0/29`, set in
+`compose.yaml`). When `cloudflared` on fair-server connects to `localhost:8480`, the app sees the
+network's gateway, `172.31.248.1`, and that single address is the default `TRUSTED_PROXIES`. The other
+fair apps' containers are on other networks, so they cannot fake the headers. If the value is wrong,
+sign-in at doors.jakemc.me is refused with "Use the fair server address"; the app never opens up.
+
+**Confirm the address `cloudflared` appears from** (on fair-server; prints the gateway, then a sign-in
+check made the same way `cloudflared` connects, which must say `"remote": true`):
 
 ```bash
-(cd /srv/fair-apps/door-control && docker network inspect door-control_default -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}' && curl -s -o /dev/null -w "fair network as public host: %{http_code} (must be 403)\n" -H 'Host: doors.jakemc.me' http://192.168.1.160:8480/api/login-info)
+(cd /srv/fair-apps/door-control && docker network inspect door-control-net -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' && curl -s -H 'Host: doors.jakemc.me' http://localhost:8480/api/login-info; echo)
 ```
 
-The first line is the gateway address `cloudflared` appears from; it must be inside `TRUSTED_PROXIES`.
-To narrow the setting to that address, add `TRUSTED_PROXIES=127.0.0.1/32,<that address>/32` to `.env`
-and run `docker compose up -d`. If `cloudflared` runs in its own Docker container, use that
-container's network range instead.
+If `cloudflared` runs in its own Docker container instead of on fair-server itself, it does not come
+from that gateway: ask before changing `TRUSTED_PROXIES`.
+
+**Check that a fair-network computer is not trusted.** Run this on another computer on the fair network
+(Mac or Linux terminal; on Windows use `curl.exe` in PowerShell), not on fair-server. It must print `403`:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -H 'Host: doors.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://192.168.1.160:8480/api/login-info
+```
+
+**If `docker compose up` says the subnet overlaps** another network, list the networks and their
+subnets on fair-server:
+
+```bash
+(docker network ls && docker network inspect $(docker network ls -q) -f '{{.Name}} {{range .IPAM.Config}}{{.Subnet}} {{end}}')
+```
+
+Pick a free `/29` (for example `172.31.249.0/29`), then change it in `compose.yaml` (subnet and
+gateway) and `TRUSTED_PROXIES` in `.env` (`172.31.249.1/32`) in the same pull request, and deploy.
+
+**Optional hardening: publish the port on 127.0.0.1 only.** In `compose.yaml`, `"0.0.0.0:8480:8480"`
+becomes `"127.0.0.1:8480:8480"`. Then nothing on the fair network can reach the app directly (the
+`http://192.168.1.160:8480` sign-in page goes away; everyone uses https://doors.jakemc.me), while
+`cloudflared` on fair-server still connects through `localhost:8480`. The scheduler and Telegram bot are
+not affected. Jake decides; it is not the default.
 
 ### Pin the UniFi console certificate (unifi.cert_sha256)
 
-The console uses a self-signed certificate. Pin it so nobody on the LAN can pretend to be the console
-and catch the API token. Print the fingerprint (from fair-server):
+The console uses a self-signed certificate. Pinning it means nobody on the LAN can pretend to be the
+console and catch the API token. Do this once after the move to Docker (the first-move block in
+`CLAUDE.md` already does it) and again whenever the console's certificate is renewed (the dashboard
+then says the certificate "does not match"). The block reads the console address from `unifi.host` in
+`/data/config.json`, so there is nothing to type in:
 
 ```bash
-(openssl s_client -connect 192.168.1.1:12445 </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256)
+(set -e
+cd /srv/fair-apps/door-control
+umask 077
+docker compose run --rm -T --no-deps app cat /data/config.json > /tmp/door-config.json
+CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); print("%s:%s" % (u.hostname, u.port or 443))' /tmp/door-config.json)
+FP=$(openssl s_client -connect "$CONSOLE" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+if [ -z "$FP" ]; then echo "Stop: could not read the certificate from $CONSOLE."; rm -f /tmp/door-config.json; exit 1; fi
+echo "UniFi console $CONSOLE certificate SHA-256: $FP"
+python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c["unifi"]["cert_sha256"]=sys.argv[2]; json.dump(c,open(p,"w"),indent=2)' /tmp/door-config.json "$FP"
+docker compose run --rm -T --no-deps app sh -c 'cat > /data/config.json.new && chmod 600 /data/config.json.new && mv /data/config.json.new /data/config.json' < /tmp/door-config.json
+rm /tmp/door-config.json
+docker compose restart
+sleep 20
+docker compose ps
+docker compose logs --tail=30)
 ```
 
-Copy the part after `=` into `"cert_sha256"` inside the `"unifi"` section of config.json (see "Change
-config.json"; colons are fine). When it is set and the certificate does not match, Door Control refuses
-to connect and the dashboard says so. When it is not set, the app works as before and prints one warning
-at startup. After a console certificate renewal, update the value.
+It prints the fingerprint it saved. To double-check it, compare with the certificate your browser shows
+for `https://<console address>:12445`. When `cert_sha256` is not set, the app works as before and prints
+one warning at startup.
 
 ### Change config.json
 
@@ -233,7 +273,8 @@ the dashboard sign-in.
 
 ### Moving from the old systemd install (one time)
 The full move, rollback and later-deploy blocks are in `CLAUDE.md` under "Where it runs". Order:
-`.env` (step 3) -> deploy block -> break-glass account -> Cloudflare row (step 4) -> checks.
+`.env` (step 3) -> deploy block (it also pins the UniFi certificate) -> break-glass account ->
+Cloudflare row (step 4) -> trusted-proxy checks -> manual checks.
 
 ## Notes and limits
 - Lock rules need a UniFi Access hub that supports them (API v1.24.6+). `Lock now` uses `lock_now`.
@@ -246,6 +287,6 @@ The full move, rollback and later-deploy blocks are in `CLAUDE.md` under "Where 
   `python3 tests/test_google.py`, `node tests/test_ui.cjs`.
 - Try it without touching real doors: `python3 mock_unifi.py 12445`, then a `config.json` with host
   `http://127.0.0.1:12445` and token `test-token`, and
-  `PUBLIC_HOSTS=localhost:8480 ALLOWED_HOSTS=localhost:8480 python3 run.py config.json`.
+  `PUBLIC_HOSTS=localhost:8480 ALLOWED_HOSTS=localhost:8480 TRUSTED_PROXIES=127.0.0.1/32 python3 run.py config.json`.
   Create a local admin with `python3 manage.py set-password admin` and sign in at http://localhost:8480
   (browsers accept the Secure cookie on localhost).
