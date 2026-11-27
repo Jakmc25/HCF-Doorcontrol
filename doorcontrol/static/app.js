@@ -1,7 +1,8 @@
 "use strict";
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 let doors = [],
-  editingId = null;
+  editingId = null,
+  csrf = "";
 const $ = (id) => document.getElementById(id);
 const esc = (s) =>
   String(s ?? "").replace(
@@ -23,12 +24,20 @@ function toast(msg, err) {
   clearTimeout(toast.h);
   toast.h = setTimeout(() => (t.className = "toast"), 3500);
 }
+// Every change carries the CSRF token from /api/bootstrap. A 401 means the session ended:
+// reloading shows the sign-in page.
 async function api(method, url, body) {
+  const headers = { "Content-Type": "application/json" };
+  if (method !== "GET") headers["X-CSRF-Token"] = csrf;
   const r = await fetch(url, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (r.status === 401) {
+    location.reload();
+    throw new Error("Sign in to continue.");
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || "Error " + r.status);
   return j;
@@ -85,10 +94,14 @@ $("doors").addEventListener("click", async (ev) => {
     return;
   b.disabled = true;
   try {
-    const r = await api("POST", `/api/doors/${b.dataset.id}/action`, {
-      action: b.dataset.act,
-      minutes,
-    });
+    const r = await api(
+      "POST",
+      `/api/doors/${encodeURIComponent(b.dataset.id)}/action`,
+      {
+        action: b.dataset.act,
+        minutes,
+      },
+    );
     toast(r.message);
   } catch (e) {
     toast(e.message, true);
@@ -235,7 +248,7 @@ async function loadUpcoming() {
       rows
         .map(
           (w) =>
-            `<tr><td>${w.active ? '<span class="now">NOW · </span>' : ""}${esc(fmt(w.start))} → ${esc(fmt(w.end))}</td><td>${esc(w.title)}</td><td>${esc(w.doors.join(", "))}</td><td><span class="pill">${w.source}</span></td></tr>`,
+            `<tr><td>${w.active ? '<span class="now">NOW · </span>' : ""}${esc(fmt(w.start))} → ${esc(fmt(w.end))}</td><td>${esc(w.title)}</td><td>${esc(w.doors.join(", "))}</td><td><span class="pill">${esc(w.source)}</span></td></tr>`,
         )
         .join("") +
       "</table>"
@@ -248,7 +261,7 @@ async function loadLog() {
       rows
         .map(
           (r) =>
-            `<tr><td>${esc(r.time)}</td><td>${esc(r.door)}</td><td class="${r.ok ? "" : "fail"}">${esc(r.ok ? r.detail : "FAILED: " + r.detail)}</td><td class="muted">${esc(r.source)}</td></tr>`,
+            `<tr><td>${esc(r.time)}</td><td>${esc(r.door)}</td><td class="${r.ok ? "" : "fail"}">${esc(r.ok ? r.detail : "FAILED: " + r.detail)}</td><td class="muted">${esc(r.user || r.source)}</td></tr>`,
         )
         .join("") +
       "</table>"
@@ -262,13 +275,38 @@ async function refreshAll() {
     ),
   );
 }
-renderDayChoices([]);
-refreshAll();
+async function bootstrap() {
+  const b = await api("GET", "/api/bootstrap");
+  csrf = b.csrf;
+  $("user").textContent = b.user || "";
+  $("signout").hidden = false;
+}
+$("signout").addEventListener("click", async () => {
+  try {
+    await api("POST", "/api/logout");
+    location.reload();
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+async function start() {
+  try {
+    await bootstrap();
+  } catch (e) {
+    toast(e.message, true);
+    return;
+  }
+  renderDayChoices([]);
+  await refreshAll();
+}
+start();
 setInterval(() => {
   loadDoors();
   loadUpcoming();
   loadLog();
 }, 20000);
+// Keep the CSRF token fresh on a dashboard left open for days.
+setInterval(() => bootstrap().catch(() => {}), 3600000);
 setInterval(
   () =>
     ($("clock").textContent = new Date().toLocaleString([], {

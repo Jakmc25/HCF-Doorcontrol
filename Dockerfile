@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -r
     && python -c "from zoneinfo import ZoneInfo; ZoneInfo('America/New_York')" \
     && useradd --uid 10001 --create-home doors
 WORKDIR /app
-COPY run.py VERSION ./
+COPY run.py manage.py VERSION ./
 COPY doorcontrol ./doorcontrol
 RUN mkdir /data && chown doors:doors /data
 USER doors

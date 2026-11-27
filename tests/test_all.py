@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.request
 import urllib.error
 from datetime import date, datetime, timedelta
@@ -292,36 +293,62 @@ class TelegramTests(unittest.TestCase):
 
 
 class WebTests(unittest.TestCase):
+    HOST = "app.test"
+
     def setUp(self):
         self.mock, self.usrv, self.eng = build()
         self.eng.fake_now = datetime(2027, 9, 6, 9, 0, tzinfo=TZ)
-        self.web = make_server(
-            {"password": "pw", "bind": "127.0.0.1", "port": 0}, self.eng
-        )
+        env = {
+            "PUBLIC_HOSTS": self.HOST,
+            "ALLOWED_HOSTS": "",
+            "GOOGLE_ALLOWED_DOMAINS": "hardincountyfair.org",
+            "GOOGLE_ALLOWED_EMAILS": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            self.web = make_server(self.eng, tempfile.mkdtemp(), "127.0.0.1", 0)
         threading.Thread(target=self.web.serve_forever, daemon=True).start()
         self.base = "http://127.0.0.1:%d" % self.web.server_address[1]
+        # A test session: a Google cookie issued by this server, plus the CSRF token.
+        self.cookie = "doors_auth=" + self.web.google.issue(
+            "tester@hardincountyfair.org"
+        )
+        self.csrf = None
+        code, raw = self.call("GET", "/api/bootstrap")
+        self.assertEqual(code, 200, raw)
+        self.csrf = json.loads(raw)["csrf"]
 
     def tearDown(self):
         self.web.shutdown()
         self.usrv.shutdown()
 
-    def call(self, method, path, body=None, pw="pw"):
+    def call(self, method, path, body=None, headers=None, session=True):
         req = urllib.request.Request(
             self.base + path,
             method=method,
             data=json.dumps(body).encode() if body is not None else None,
         )
-        req.add_header(
-            "Authorization", "Basic " + base64.b64encode(("u:" + pw).encode()).decode()
-        )
+        req.add_header("Host", self.HOST)
+        if session:
+            req.add_header("Cookie", self.cookie)
+            if self.csrf:
+                req.add_header("X-CSRF-Token", self.csrf)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
         try:
             with urllib.request.urlopen(req) as r:
+                if "doors_session=" in (r.headers.get("Set-Cookie") or ""):
+                    self.cookie += "; " + r.headers["Set-Cookie"].split(";")[0]
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
 
-    def test_auth(self):
-        self.assertEqual(self.call("GET", "/api/doors", pw="wrong")[0], 401)
+    def test_basic_header_refused(self):
+        basic = "Basic " + base64.b64encode(b"u:pw").decode()
+        code, raw = self.call(
+            "GET", "/api/doors", headers={"Authorization": basic}, session=False
+        )
+        self.assertEqual(code, 401)
+        self.assertNotIn(b"Event Center", raw)
         self.assertEqual(self.call("GET", "/api/doors")[0], 200)
         self.assertIn(b"Door Control", self.call("GET", "/")[1])
 

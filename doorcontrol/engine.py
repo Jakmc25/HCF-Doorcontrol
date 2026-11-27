@@ -178,7 +178,7 @@ class Engine:
         return out
 
     # ---- actions ----
-    def door_action(self, door, action, minutes=None, source="manual"):
+    def door_action(self, door, action, minutes=None, source="manual", user=""):
         """Apply one action to one door. Raises UnifiError on failure. Returns a short description."""
         if action not in ACTIONS:
             raise ValueError("Unknown action '%s'" % action)
@@ -204,9 +204,9 @@ class Engine:
                 self.client.unlock(door["id"])
                 desc = "opened (momentary unlock)"
         except UnifiError as e:
-            self.db.log(label, action, source, False, str(e))
+            self.db.log(label, action, source, False, str(e), user=user)
             raise
-        self.db.log(label, action, source, True, desc)
+        self.db.log(label, action, source, True, desc, user=user)
         return desc
 
     # ---- windows ----

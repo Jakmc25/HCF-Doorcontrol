@@ -36,7 +36,17 @@ class DB:
         self.lock = threading.RLock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self):
+        """Additive only: never recreate a table or change existing rows."""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(log)")}
+        if "user" not in cols:
+            # Who did it (signed-in email or admin account); empty for scheduler/Telegram rows.
+            self.conn.execute(
+                "ALTER TABLE log ADD COLUMN \"user\" TEXT NOT NULL DEFAULT ''"
+            )
 
     # ---- schedules ----
     @staticmethod
@@ -119,11 +129,12 @@ class DB:
             self.conn.commit()
 
     # ---- activity log ----
-    def log(self, door, action, source, ok, detail=""):
+    def log(self, door, action, source, ok, detail="", user=""):
         with self.lock:
             self.conn.execute(
-                "INSERT INTO log(ts,door,action,source,ok,detail) VALUES(?,?,?,?,?,?)",
-                (time.time(), door, action, source, 1 if ok else 0, detail),
+                'INSERT INTO log(ts,door,action,source,ok,detail,"user") '
+                "VALUES(?,?,?,?,?,?,?)",
+                (time.time(), door, action, source, 1 if ok else 0, detail, user or ""),
             )
             self.conn.execute(
                 "DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - 1000"

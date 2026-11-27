@@ -137,6 +137,14 @@ const LOG = [
 ];
 function dashboardResponses(extra = {}) {
   return {
+    "GET /api/bootstrap": {
+      status: 200,
+      body: {
+        csrf: "tok123",
+        user: "jake@hardincountyfair.org",
+        version: "1.0.0",
+      },
+    },
     "GET /api/doors": { status: 200, body: DOORS },
     "GET /api/schedules": { status: 200, body: SCHEDS },
     "GET /api/upcoming": { status: 200, body: [] },
@@ -172,6 +180,40 @@ test("door button posts the action", async () => {
     action: "unlock_for",
     minutes: 60,
   });
+  assert.strictEqual(post.headers["X-CSRF-Token"], "tok123");
+  // GETs never carry the token.
+  assert.ok(
+    calls
+      .filter((c) => c.method === "GET")
+      .every((c) => !("X-CSRF-Token" in c.headers)),
+  );
+});
+
+test("header shows email and Sign out; sign out posts with CSRF token", async () => {
+  const { $, calls, ctx } = load(
+    "app.js",
+    dashboardResponses({ "POST /api/logout": { status: 200, body: {} } }),
+  );
+  await settle();
+  assert.strictEqual(calls[0].url, "/api/bootstrap", "bootstrap comes first");
+  assert.strictEqual($("user").textContent, "jake@hardincountyfair.org");
+  assert.strictEqual($("signout").hidden, false);
+  await $("signout").fire("click", {});
+  const out = calls.find((c) => c.url === "/api/logout");
+  assert.strictEqual(out.method, "POST");
+  assert.strictEqual(out.headers["X-CSRF-Token"], "tok123");
+  assert.strictEqual(ctx.location.reloaded, 1, "reloads to the sign-in page");
+});
+
+test("any 401 reloads to the sign-in page", async () => {
+  const { ctx } = load(
+    "app.js",
+    dashboardResponses({
+      "GET /api/bootstrap": { status: 401, body: { error: "Sign in" } },
+    }),
+  );
+  await settle();
+  assert.ok(ctx.location.reloaded >= 1);
 });
 
 test("schedule list and form: add, edit shows Cancel, cancel hides it", async () => {
@@ -215,8 +257,99 @@ test("activity log renders and marks failures", async () => {
   assert.match(html, /FAILED: Cannot reach UniFi Access/);
 });
 
+test("By shows user, else source", async () => {
+  const { $ } = load("app.js", dashboardResponses());
+  await settle();
+  const cells = [
+    ...$("log").innerHTML.matchAll(/<td class="muted">([^<]*)<\/td>/g),
+  ].map((m) => m[1]);
+  assert.deepStrictEqual(cells, [
+    "jake@hardincountyfair.org",
+    "scheduler: Office hours",
+    "telegram",
+  ]);
+});
+
+function loginInfo(info) {
+  return { "GET /api/login-info": { status: 200, body: info } };
+}
+
+test("login: Google button is the main way in; Admin sign-in link, not main button", async () => {
+  const { $ } = load(
+    "login.js",
+    loginInfo({
+      google: true,
+      google_url: "/api/auth/google/start",
+      remote: true,
+      password: true,
+    }),
+  );
+  await settle();
+  assert.strictEqual($("google").hidden, false);
+  assert.strictEqual($("admin").hidden, false);
+  assert.notStrictEqual($("admin").open, true, "admin form starts closed");
+  const html = fs.readFileSync(path.join(STATIC, "login.html"), "utf8");
+  assert.match(html, /<details[^>]*id="admin"[^>]*hidden/);
+  assert.doesNotMatch(html, /<details[^>]*\sopen/);
+});
+
+test("login: Admin sign-in link hidden when password is false", async () => {
+  const { $ } = load(
+    "login.js",
+    loginInfo({
+      google: true,
+      google_url: "/api/auth/google/start",
+      remote: true,
+      password: false,
+    }),
+  );
+  $("admin").hidden = true; // as in login.html
+  await settle();
+  assert.strictEqual($("admin").hidden, true);
+});
+
+test("login: on the fair network Google points at the public host, no password form", async () => {
+  const { $ } = load(
+    "login.js",
+    loginInfo({
+      google: true,
+      google_url: "https://doors.jakemc.me/api/auth/google/start",
+      remote: false,
+      password: true,
+    }),
+  );
+  $("admin").hidden = true;
+  await settle();
+  assert.strictEqual(
+    $("google").href,
+    "https://doors.jakemc.me/api/auth/google/start",
+  );
+  assert.match($("google-note").textContent, /doors\.jakemc\.me/);
+  assert.strictEqual($("admin").hidden, true);
+});
+
+test("login: password form posts and goes to the dashboard", async () => {
+  const { $, calls, ctx } = load("login.js", {
+    ...loginInfo({ google: false, remote: true, password: true }),
+    "POST /api/login": { status: 200, body: { ok: true } },
+  });
+  await settle();
+  const f = $("login");
+  const btn = { disabled: false, textContent: "" };
+  f.querySelector = () => btn;
+  f.name = { value: "admin" };
+  f.password = { value: "a long random password", select() {} };
+  await f.fire("submit", { preventDefault() {} });
+  const post = calls.find((c) => c.url === "/api/login");
+  assert.deepStrictEqual(JSON.parse(post.body), {
+    name: "admin",
+    password: "a long random password",
+  });
+  assert.strictEqual(ctx.location.replaced, "/");
+});
+
 test("no inline style or event handlers in built HTML", () => {
-  for (const f of ["app.js", "index.html"]) {
+  for (const f of ["app.js", "index.html", "login.js", "login.html"]) {
     const src = fs.readFileSync(path.join(STATIC, f), "utf8");
     assert.doesNotMatch(src, /\sstyle\s*=/i, f + " has style=");
     assert.doesNotMatch(src, /\son[a-z]+\s*=\s*["']/i, f + " has on...=");

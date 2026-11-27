@@ -29,15 +29,18 @@ def main(argv=None):
     )
     log = logging.getLogger("doorcontrol")
 
-    web_cfg = cfg.get("web", {})
-    if not web_cfg.get("password") or web_cfg["password"] == "change-me":
-        sys.exit("Set web.password in config.json (it protects the lock controls).")
+    # Sign-in replaced the dashboard password; DATA_DIR replaced db_path.
+    obsolete = [k for k in ("web", "db_path") if k in cfg]
+    if obsolete:
+        log.warning(
+            "config.json: %s no longer used and ignored (sign-in replaced the "
+            "password; DATA_DIR sets the data folder).",
+            ", ".join(obsolete),
+        )
     u = cfg["unifi"]
     if not u.get("token") or u["token"].startswith("PASTE"):
         sys.exit("Set unifi.token in config.json.")
 
-    if "db_path" in cfg:
-        log.warning("config.json: db_path is no longer used; DATA_DIR sets the folder.")
     os.makedirs(data_dir, exist_ok=True)
     db_path = os.path.join(data_dir, "doorcontrol.db")
     tz = ZoneInfo(cfg.get("timezone", "America/New_York"))
@@ -53,7 +56,7 @@ def main(argv=None):
 
     bind = os.environ.get("BIND", "0.0.0.0")
     port = int(os.environ.get("PORT", "8480"))
-    server = make_server({**web_cfg, "bind": bind, "port": port}, engine)
+    server = make_server(engine, data_dir, bind, port)
     log.info("Door Control running on http://%s:%s", bind, port)
     try:
         server.serve_forever()
