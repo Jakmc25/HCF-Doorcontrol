@@ -42,7 +42,7 @@ Reference (read-only, not modified): Awards `/home/claude/hcf_awards` (`google_s
 | `timezone`, `unifi.{host,token,verify_tls}`, `telegram.{token,allowed_chat_ids}`, `calendar.*`, `default_unlock_minutes`, `tick_seconds` | `/data/config.json` in the volume, mode 600, owner uid 10001 | Unchanged app settings; the UniFi/Telegram tokens and secret iCal URL stay in one 600 file, not in the environment. |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS`, `GOOGLE_ALLOWED_EMAILS` (blank), `PUBLIC_HOSTS`, `ALLOWED_HOSTS` | `.env` next to `compose.yaml` (AC25) | Same as Awards; sign-in settings. |
 | session secret, break-glass accounts, database | `/data/session-secret` (600), `/data/accounts.json` (600, via `auth.Auth.save`), `/data/doorcontrol.db` | AC24, AC31. |
-| `web.password`, `web.bind`, `web.port`, `db_path` | removed | AC5. In Docker, `DATA_DIR=/data` decides config/db/secret paths; bind/port come from env `BIND` (default `0.0.0.0`) and `PORT` (default `8480`). If old keys are still present they are ignored with one warning line. |
+| `web.password`, `web.bind`, `web.port`, `db_path` | removed | AC5. In Docker, `DATA_DIR=/data` decides config/db/secret paths; bind/port come from env `BIND` (default `0.0.0.0`) and `PORT` (default `8480`). If old keys are still present they are ignored with one warning line. | **Note (round 3): this is inside the container; the host publish is `127.0.0.1:8480` only.**
 
 Local runs keep working: `python3 run.py config.json` uses `DATA_DIR` default `data/`.
 
@@ -67,7 +67,7 @@ Local runs keep working: `python3 run.py config.json` uses `DATA_DIR` default `d
 | `manage.py` | New: `set-password NAME` (getpass, or stdin when not a TTY; refuses < 12 chars), `users`, `remove-user NAME` | AC31 |
 | `config.example.json` | Remove `web` section and `db_path` | AC5 |
 | `Dockerfile` | New: `python:3.13-slim-bookworm`, `apt-get install tzdata` (engine needs `zoneinfo` data) and a build-time `ZoneInfo("America/New_York")` check, user `doors` uid 10001, `COPY run.py manage.py VERSION ./` + `COPY doorcontrol ./doorcontrol`, `ENV DATA_DIR=/data PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1`, `EXPOSE 8480`, `HEALTHCHECK` on `http://127.0.0.1:8480/health` | AC24, AC27 |
-| `compose.yaml` | New: `name: door-control`, `image: door-control:1.0.0`, `restart: unless-stopped`, `init: true`, `ports: "0.0.0.0:8480:8480"`, env from `.env` (`${VAR:-}`), volume `door_control_data:/data` with `name: door_control_data`, `read_only: true`, `tmpfs: /tmp:size=16m,mode=1777`, `no-new-privileges` | AC24, AC25 |
+| `compose.yaml` | New: `name: door-control`, `image: door-control:1.0.0`, `restart: unless-stopped`, `init: true`, `ports: "0.0.0.0:8480:8480"`, env from `.env` (`${VAR:-}`), volume `door_control_data:/data` with `name: door_control_data`, `read_only: true`, `tmpfs: /tmp:size=16m,mode=1777`, `no-new-privileges` | AC24, AC25 | **SUPERSEDED in round 3: the port is published as `127.0.0.1:8480:8480` (loopback only).**
 | `.dockerignore` | New: `.git`, `.env`, `config.json`, `data/`, `*.db`, `tests`, `docs`, `.claude`, `__pycache__`, `mock_unifi.py` | AC25 |
 | `.env.example` | New: the 6 keys, no real values | AC25 |
 | `.gitignore` | Add `.env` | AC25 |
@@ -161,7 +161,7 @@ echo "Backup in $BK")
 
 **P3. Cloudflare public hostname - only after the container is healthy** (adding it while the old Basic-auth app ran would have put that app on the internet). Cloudflare Zero Trust -> Networks -> Tunnels -> the fair-server tunnel -> Configure -> **Public Hostname -> Add a public hostname**: Subdomain `doors`, Domain `jakemc.me`, Service type `HTTP`, URL written the same way as the existing `awards.jakemc.me` row but with port **8480** (e.g. `localhost:8480`). Save. Do not edit any other row; afterwards open awards.jakemc.me once to confirm the other apps still load.
 
-**Manual checks on fair-server (AC24, AC11 Cloudflare route):** `https://doors.jakemc.me` shows the sign-in page; Google sign-in with a hardincountyfair.org account reaches the dashboard and the email shows in the header; a gmail.com account is refused; door list loads (UniFi reachable from the container); one "Unlock 1 hr" on a test door shows your email in Recent activity, then "Back to normal"; a Telegram `/doors` answers (outbound reachable, only one bot copy); `http://192.168.1.160:8480` shows the sign-in page only; `curl -s -H 'Host: other.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://127.0.0.1:8480/api/doors` returns 404; admin sign-in works at doors.jakemc.me.
+**Manual checks on fair-server (AC24, AC11 Cloudflare route):** `https://doors.jakemc.me` shows the sign-in page; Google sign-in with a hardincountyfair.org account reaches the dashboard and the email shows in the header; a gmail.com account is refused; door list loads (UniFi reachable from the container); one "Unlock 1 hr" on a test door shows your email in Recent activity, then "Back to normal"; a Telegram `/doors` answers (outbound reachable, only one bot copy); `http://192.168.1.160:8480` shows the sign-in page only (**SUPERSEDED in round 3: it must now be unreachable, connection refused**); `curl -s -H 'Host: other.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://127.0.0.1:8480/api/doors` returns 404; admin sign-in works at doors.jakemc.me.
 
 ### Later deploys (goes into CLAUDE.md)
 ```bash

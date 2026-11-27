@@ -28,6 +28,17 @@ accounts (gmail.com and others) are refused. Your email shows at the top right, 
   person's email. Scheduler rows show the schedule name, Telegram rows show "telegram". The log keeps
   the newest 1000 rows; sign-ins count toward that.
 
+### Docker Engine version on fair-server
+
+Docker Engine must be version **28 or newer**: older versions could let other machines on the same
+network reach ports published on `127.0.0.1`. Check before every deploy:
+
+```bash
+docker version --format '{{.Server.Version}}'
+```
+
+If it prints a version older than 28: do not deploy; tell Jake.
+
 ### If the internet or the Cloudflare tunnel is down
 
 There is no dashboard (it is reachable only through doors.jakemc.me). The scheduler and the Telegram
@@ -69,7 +80,7 @@ Setting a new password signs that account out everywhere.
 
 | Where | What |
 |---|---|
-| `.env` next to `compose.yaml` (git-ignored, mode 600) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (leave empty), `PUBLIC_HOSTS=doors.jakemc.me`, `ALLOWED_HOSTS` (fair-network addresses; empty refuses them all), optional `TRUSTED_PROXIES` (see below). See `.env.example`. |
+| `.env` next to `compose.yaml` (git-ignored, mode 600) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (leave empty), `PUBLIC_HOSTS=doors.jakemc.me`, `ALLOWED_HOSTS` (defense in depth: host names accepted for direct requests; the port is published on loopback only, so it matters only if the port is ever re-published on the fair network; empty refuses every other address), optional `TRUSTED_PROXIES` (see below). See `.env.example`. |
 | `/data/config.json` in the `door_control_data` volume (mode 600) | UniFi host, API token and optional `cert_sha256`, Telegram bot token and allowed chat IDs, Google Calendar secret iCal URL, time zone, default unlock minutes. See `config.example.json`. |
 | `/data/doorcontrol.db`, `/data/session-secret`, `/data/accounts.json` | Schedules, door state and activity log; session signing key; break-glass account. |
 
@@ -186,7 +197,9 @@ docker compose run --rm -T --no-deps --user 0 -v "$BK":/out app sh -c 'python -c
 ls -l "$BK")
 ```
 
-Restore one of those folders (stops the app, copies the files back, starts it):
+Restore one of those folders. First it saves the current state to a new dated `pre-restore-` folder
+(same layout as a backup), then stops the app, copies the files back and starts it. If the safety
+backup fails, nothing is changed:
 
 ```bash
 (set -e
@@ -195,6 +208,11 @@ ls /srv/fair-apps/door-control-backups
 read -rp "Backup folder name to restore: " NAME
 BK=/srv/fair-apps/door-control-backups/$NAME
 test -f "$BK/doorcontrol.db"
+PRE=/srv/fair-apps/door-control-backups/pre-restore-$(date +%Y%m%d-%H%M%S)
+mkdir -p -m 700 "$PRE"
+docker compose run --rm -T --no-deps --user 0 -v "$PRE":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && for f in config.json accounts.json session-secret; do if [ -e /data/$f ]; then cp /data/$f /out/; fi; done && chmod 600 /out/*'
+test -f "$PRE/doorcontrol.db"
+echo "Current state saved in $PRE"
 docker compose stop
 docker compose run --rm -T --no-deps --user 0 -v "$BK":/in:ro app sh -c 'for f in doorcontrol.db config.json accounts.json session-secret; do if [ -e /in/$f ]; then cp /in/$f /data/$f && chown 10001:10001 /data/$f && chmod 600 /data/$f; fi; done'
 docker compose up -d
@@ -226,11 +244,14 @@ Never run `docker compose down -v`: it deletes the volume with every schedule an
 To replace a lost or deleted client, repeat steps 2-3 and write the new values with the `.env` block below.
 
 ### 3. `.env` on fair-server
-Prompts for the two Google values; nothing to edit by hand:
+Prompts for the two Google values; nothing to edit by hand. The block **writes a whole new `.env`**
+(it replaces everything in it) and therefore refuses to run when a `.env` already exists. To change
+one value later, edit that line in `.env` with `nano` and run `docker compose up -d`:
 
 ```bash
 (set -e
 cd /srv/fair-apps/door-control
+if [ -e .env ]; then echo "Stop: .env already exists; this block would replace all of it. Nothing was changed."; exit 1; fi
 read -rp "Google Client ID: " GID
 read -rsp "Google Client secret (hidden): " GSECRET; echo
 umask 077

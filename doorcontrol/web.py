@@ -60,7 +60,7 @@ SECURITY_HEADERS = {
 SERVER_ERROR = "The request could not be completed. Nothing was changed."
 # Only these TCP peers may vouch for a request through CF-Connecting-IP and the public Host.
 # Default: the gateway of the app's own compose network (door-control-net, 172.31.248.0/29),
-# which is where cloudflared on fair-server appears when it connects to localhost:8480.
+# which is where cloudflared on fair-server appears when it connects to 127.0.0.1:8480.
 # Other containers (other fair apps) are on other networks and are not trusted. Loopback is
 # left out: inside the container only Docker's health check uses it, and /health needs no
 # trust. Wrong value = public sign-in refused, never open. X-Forwarded-* headers are ignored.

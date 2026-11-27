@@ -93,6 +93,12 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   The deploy prints a reminder when the UniFi certificate is not pinned yet; then run the README block
   "Pin the UniFi console certificate" (it reads the console address from config.json). Run it again
   after the console's certificate is renewed.
+- Docker Engine on fair-server must be version 28 or newer (older versions could let other machines on
+  the same network reach ports published on 127.0.0.1). Check before every deploy:
+  ```bash
+  docker version --format '{{.Server.Version}}'
+  ```
+  If it prints a version older than 28: do not deploy; tell Jake.
 - Don't deploy within 15 minutes of a schedule or calendar window starting/ending, or during the fair.
 - Never run `docker compose down -v`. Never run the old `door-control` systemd service and the container
   together (both drive the doors and poll the bot).
@@ -162,14 +168,28 @@ another fair-network computer (README "Trusted proxies"); `curl -s -H 'Host: oth
 returns 404; admin sign-in works at doors.jakemc.me; awards.jakemc.me still loads.
 
 ### Rollback to the systemd version
-First remove the `doors.jakemc.me` row from the Cloudflare tunnel (that row only), then:
+First remove the `doors.jakemc.me` row from the Cloudflare tunnel (that row only), then. Every check
+runs before the container is stopped; after the stop, any failure starts the Docker version again
+(`restore_new`) so the app is never left down:
 ```bash
-(set -e
+(set -eE
 cd /srv/fair-apps/door-control
+OLD=$(cat /srv/fair-apps/door-control-backups/pre-docker-commit 2>/dev/null || true)
+if [ -z "$OLD" ] || ! git rev-parse --verify -q "$OLD^{commit}" >/dev/null; then echo "Stop: no usable pre-docker-commit file; nothing was changed."; exit 1; fi
+mkdir -p data
+restore_new() {
+  trap - ERR
+  echo "Rollback FAILED: starting the Docker version again."
+  git checkout -q main || true
+  docker compose up -d || true
+  docker compose ps || true
+}
+trap restore_new ERR
 docker compose stop
-mv data/doorcontrol.db "data/doorcontrol.db.before-rollback-$(date +%Y%m%d-%H%M%S)"
+if [ -e data/doorcontrol.db ]; then mv data/doorcontrol.db "data/doorcontrol.db.before-rollback-$(date +%Y%m%d-%H%M%S)"; fi
 docker compose run --rm -T --no-deps --user 0 -v "$PWD/data":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && chown --reference=/out /out/doorcontrol.db'
-git checkout "$(cat /srv/fair-apps/door-control-backups/pre-docker-commit)"
+git checkout "$OLD"
+trap - ERR
 sudo systemctl enable --now door-control
 sleep 5
 systemctl status door-control --no-pager)

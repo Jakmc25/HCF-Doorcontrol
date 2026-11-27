@@ -24,6 +24,12 @@ Tests at review time: test_all 16, test_google 41, test_ui 12 (all pass). Q1 is 
 | S11 | SHOULD-FIX (round 2) | compose.yaml, web.py | Default TRUSTED_PROXIES 172.16.0.0/12 trusts every container on fair-server. | fixed (round 3): port published on 127.0.0.1:8480 only (containers cannot reach host loopback; cloudflared uses 127.0.0.1:8480), TRUSTED_PROXIES stays the door-control-net gateway /32; docs say dashboard only via doors.jakemc.me, fair-network check = cannot connect; re-publish warning; test_compose_publishes_on_loopback_only |
 | N1 | NIT (round 3) | README, CLAUDE.md | Cert-pin block breaks on an IPv6 unifi.host; leftover run.sh. | fixed: brackets for IPv6 (test_pin_block_handles_ipv6_console); run.sh deleted |
 | D1 | DOCS (round 2) | CLAUDE.md, README | Deploy steps should pin the UniFi certificate. | fixed: first-move block reads the fingerprint before stopping the old service and saves unifi.cert_sha256; routine deploy prints a reminder; README pin block; console address read from unifi.host |
+| R4-1 | BLOCKER (round 4) | README restore block | Restore overwrote live data with no backup of the current state. | fixed: dated pre-restore- backup (SQLite backup + file copy) first; aborts if it fails |
+| R4-2 | BLOCKER (round 4) | CLAUDE.md rollback block | Unguarded `mv` under set -e could leave the app down after `docker compose stop`. | fixed: checks before the stop, `mv` guarded, ERR trap `restore_new` restarts Docker; README has no copy of this block |
+| R4-3 | NIT (round 4) | .env.example, README step 3 | Optional PORT/BIND/DATA_DIR/DOORCONTROL_CONFIG missing; `.env` heredoc silently replaced an existing file. | fixed: commented defaults; block refuses to overwrite and README says it replaces the whole file |
+| R4-4 | NIT (round 4) | web.py comment, README Settings | localhost:8480 and "fair-network addresses" wording. | fixed: 127.0.0.1:8480; ALLOWED_HOSTS described as defense in depth |
+| R4-5 | DOCS (round 4) | PLAN.md | Old 0.0.0.0 / "sign-in page only" lines. | fixed: SUPERSEDED in round 3 notes added, history kept |
+| R4-6 | DOCS (round 4) | README, CLAUDE.md | No Docker Engine version check. | fixed: `docker version` check (28 or newer; older: do not deploy, tell Jake) |
 
 Checked and clean (QA/code/security): 401 on all /api routes and non-public static files; /static traversal; old Basic password refused;
 forged/missing CSRF and foreign Origin refused; tampered cookies refused; accounts.json mode 600; additive log.user migration on an old DB;
