@@ -213,12 +213,16 @@ mkdir -p -m 700 "$PRE"
 docker compose run --rm -T --no-deps --user 0 -v "$PRE":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && for f in config.json accounts.json session-secret; do if [ -e /data/$f ]; then cp /data/$f /out/; fi; done && chmod 600 /out/*'
 test -f "$PRE/doorcontrol.db"
 echo "Current state saved in $PRE"
+trap 'echo "Restore FAILED: starting the app again with the data as it was."; docker compose up -d || true' ERR
 docker compose stop
 docker compose run --rm -T --no-deps --user 0 -v "$BK":/in:ro app sh -c 'for f in doorcontrol.db config.json accounts.json session-secret; do if [ -e /in/$f ]; then cp /in/$f /data/$f && chown 10001:10001 /data/$f && chmod 600 /data/$f; fi; done'
+trap - ERR
 docker compose up -d
 sleep 20
 docker compose ps)
 ```
+
+If your connection drops while that block runs (after the stop), run `cd /srv/fair-apps/door-control && docker compose up -d`.
 
 Never run `docker compose down -v`: it deletes the volume with every schedule and the activity log.
 

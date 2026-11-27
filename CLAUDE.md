@@ -181,6 +181,7 @@ restore_new() {
   trap - ERR
   echo "Rollback FAILED: starting the Docker version again."
   sudo systemctl stop door-control || true
+  sudo systemctl disable door-control || true
   git checkout -q main || true
   docker compose up -d || true
   docker compose ps || true
@@ -196,8 +197,15 @@ systemctl is-active --quiet door-control
 trap - ERR
 systemctl status door-control --no-pager)
 ```
-The old version reads the copied database (the `user` column is additive). The volume stays. To go
-forward again: the normal deploy block.
+The old version reads the copied database (the `user` column is additive). The volume stays. If your
+connection drops while the block runs (after the stop), run `cd /srv/fair-apps/door-control && docker compose up -d`
+to bring the Docker version back (or `sudo systemctl enable --now door-control` for the old one), never both.
+
+To go forward again, first stop and disable the old service (two copies must never run together),
+then run the normal deploy block:
+```bash
+(set -e; sudo systemctl stop door-control; sudo systemctl disable door-control; ! systemctl is-active --quiet door-control)
+```
 
 ## Connections to other apps
 No app-to-app links; no app reads this app's data. Talks to the UniFi Access console on the LAN (:12445),
