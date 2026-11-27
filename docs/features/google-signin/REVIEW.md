@@ -21,7 +21,8 @@ Tests at review time: test_all 16, test_google 41, test_ui 12 (all pass). Q1 is 
 | S7 | NIT | google_signin.py | No PKCE; state cookie not cleared after callback. | not fixed: shared copy pinned to Awards; follow-up for all apps |
 | C3 | NIT | *.md | `prettier --check .` flags Markdown (AC26 covers JS/CSS/HTML only). | not fixed |
 | C5 | NIT | .dockerignore | `.env.*` also excludes `.env.example`. | not fixed (harmless) |
-| S11 | SHOULD-FIX (round 2) | compose.yaml, web.py | Default TRUSTED_PROXIES 172.16.0.0/12 trusts every container on fair-server. | fixed: own network door-control-net 172.31.248.0/29, default TRUSTED_PROXIES 172.31.248.1/32 only (loopback dropped); README checks, subnet-clash steps, optional 127.0.0.1 publish; tests |
+| S11 | SHOULD-FIX (round 2) | compose.yaml, web.py | Default TRUSTED_PROXIES 172.16.0.0/12 trusts every container on fair-server. | fixed (round 3): port published on 127.0.0.1:8480 only (containers cannot reach host loopback; cloudflared uses 127.0.0.1:8480), TRUSTED_PROXIES stays the door-control-net gateway /32; docs say dashboard only via doors.jakemc.me, fair-network check = cannot connect; re-publish warning; test_compose_publishes_on_loopback_only |
+| N1 | NIT (round 3) | README, CLAUDE.md | Cert-pin block breaks on an IPv6 unifi.host; leftover run.sh. | fixed: brackets for IPv6 (test_pin_block_handles_ipv6_console); run.sh deleted |
 | D1 | DOCS (round 2) | CLAUDE.md, README | Deploy steps should pin the UniFi certificate. | fixed: first-move block reads the fingerprint before stopping the old service and saves unifi.cert_sha256; routine deploy prints a reminder; README pin block; console address read from unifi.host |
 
 Checked and clean (QA/code/security): 401 on all /api routes and non-public static files; /static traversal; old Basic password refused;

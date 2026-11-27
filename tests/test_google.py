@@ -1495,11 +1495,13 @@ class RepoTests(unittest.TestCase):
         self.assertIn("subnet: 172.31.248.0/29", compose)
         self.assertIn("gateway: 172.31.248.1\n", compose)
         self.assertIn("${TRUSTED_PROXIES:-%s}" % web.DEFAULT_TRUSTED_PROXIES, compose)
-        self.assertIn('"0.0.0.0:8480:8480"', compose)
+        self.assertNotIn("0.0.0.0", compose)
         for name in ("README.md", "CLAUDE.md"):
             self.assertIn("door-control-net", read(name))
             self.assertNotIn("172.16.0.0/12", read(name))
-        self.assertIn("127.0.0.1:8480:8480", read("README.md"), "optional hardening")
+        self.assertIn(
+            "0.0.0.0:8480:8480", read("README.md"), "how to re-publish, with warning"
+        )
         self.assertIn("docker network inspect", read("README.md"))
 
     def test_deploy_steps_pin_the_unifi_certificate(self):
@@ -1516,6 +1518,38 @@ class RepoTests(unittest.TestCase):
         )[1]
         self.assertIn("openssl s_client", pin)
         self.assertIn('["unifi"]["host"]', pin, "console address read from config.json")
+
+    def test_compose_publishes_on_loopback_only(self):
+        compose = read("compose.yaml")
+        ports = re.findall(r'(?m)^\s*- "([^"]*:8480)"', compose)
+        self.assertEqual(ports, ["127.0.0.1:8480:8480"])
+        self.assertNotIn("network_mode", compose)
+        readme = read("README.md")
+        self.assertIn("reachable only through **https://doors.jakemc.me**", readme)
+        self.assertIn("cannot connect", readme)
+        self.assertIn("URL **`127.0.0.1:8480`**", readme)
+        self.assertFalse(os.path.exists(os.path.join(ROOT, "run.sh")))
+
+    def test_pin_block_handles_ipv6_console(self):
+        for name in ("README.md", "CLAUDE.md"):
+            text = read(name)
+            snippet = re.search(r"CONSOLE=\$\(python3 -c '([^']*)'", text).group(1)
+            for host, want in (
+                ("https://192.168.1.1:12445", "192.168.1.1:12445"),
+                ("https://[fd00::1]:12445", "[fd00::1]:12445"),
+                ("https://console.local", "console.local:443"),
+            ):
+                with self.subTest(name, host=host):
+                    cfg = os.path.join(tempfile.mkdtemp(), "c.json")
+                    with open(cfg, "w") as f:
+                        json.dump({"unifi": {"host": host}}, f)
+                    out = subprocess.run(
+                        [sys.executable, "-c", snippet, cfg],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout.strip()
+                    self.assertEqual(out, want)
 
 
 if __name__ == "__main__":

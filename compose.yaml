@@ -5,8 +5,11 @@ services:
     image: door-control:1.0.0
     restart: unless-stopped
     init: true
+    # Published on fair-server's loopback only: cloudflared (on the host) connects to
+    # 127.0.0.1:8480; containers and the fair network cannot reach it. See README
+    # "Publishing on the fair network" before changing this line.
     ports:
-      - "0.0.0.0:8480:8480"
+      - "127.0.0.1:8480:8480"
     environment:
       # Values come from .env next to this file (never commit it); see .env.example.
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}

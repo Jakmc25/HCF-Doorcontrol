@@ -12,6 +12,8 @@ First numbered release.
 - Security: strict CSP and security headers on every response, CSRF token on every change, Cloudflare
   traffic for other hostnames refused, plain error messages.
 - Code formatted with black and prettier; JS and CSS moved out of `index.html`.
+- Review round 3: the port is published on 127.0.0.1 only; the dashboard is reachable only through
+  https://doors.jakemc.me (Cloudflare tunnel URL `127.0.0.1:8480`). Pin block handles IPv6 consoles.
 - Review round 2: the app gets its own Docker network `door-control-net` (172.31.248.0/29) and only
   its gateway (172.31.248.1, where cloudflared on fair-server appears) is trusted; deploy steps pin the
   UniFi console certificate.

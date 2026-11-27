@@ -14,8 +14,9 @@ Open **https://doors.jakemc.me** from anywhere and press **Sign in with Google**
 `@hardincountyfair.org` Google account can view and control every door and schedule. Personal
 accounts (gmail.com and others) are refused. Your email shows at the top right, next to **Sign out**.
 
-- On the fair network, `http://192.168.1.160:8480` shows the sign-in page only; its Google button
-  continues at doors.jakemc.me. The dashboard itself always runs at the internet address.
+- The dashboard is reachable only through **https://doors.jakemc.me** (or on fair-server itself).
+  Nothing on the fair network can connect to it directly: the port is published on fair-server's
+  loopback only, and sign-in needs HTTPS anyway. The scheduler and the Telegram bot are not affected.
 - A sign-in lasts 14 days (`SESSION_DAYS` in `doorcontrol/web.py`). **Sign out** clears it in that
   browser only.
 - **Sign everyone out** (for example after a lost laptop): delete the session secret and restart.
@@ -29,8 +30,8 @@ accounts (gmail.com and others) are refused. Your email shows at the top right, 
 
 ### If the internet or the Cloudflare tunnel is down
 
-There is no dashboard (sign-in only works over HTTPS at doors.jakemc.me). The scheduler and the
-Telegram bot keep running on fair-server. Use the **UniFi Access app** on the fair network to lock or
+There is no dashboard (it is reachable only through doors.jakemc.me). The scheduler and the Telegram
+bot keep running on fair-server. Use the **UniFi Access app** on the fair network to lock or
 unlock a door by hand.
 
 ## If you cannot sign in
@@ -81,27 +82,31 @@ Door Control believes the `CF-Connecting-IP` header and the doors.jakemc.me host
 connection comes from a trusted proxy: `cloudflared` (the Cloudflare tunnel) on fair-server. Anyone else
 who sends those headers is treated as an ordinary fair-network visitor.
 
-The app runs on its own small Docker network, `door-control-net` (`172.31.248.0/29`, set in
-`compose.yaml`). When `cloudflared` on fair-server connects to `localhost:8480`, the app sees the
-network's gateway, `172.31.248.1`, and that single address is the default `TRUSTED_PROXIES`. The other
-fair apps' containers are on other networks, so they cannot fake the headers. If the value is wrong,
-sign-in at doors.jakemc.me is refused with "Use the fair server address"; the app never opens up.
+The port is published on fair-server's loopback only (`127.0.0.1:8480` in `compose.yaml`), so the only
+way in is from fair-server itself, where `cloudflared` runs. Other containers (the other fair apps)
+cannot reach the host's loopback, and fair-network computers cannot connect at all. The app runs on its
+own small Docker network, `door-control-net` (`172.31.248.0/29`); a connection to `127.0.0.1:8480` on
+fair-server arrives from that network's gateway, `172.31.248.1`, which is the default
+`TRUSTED_PROXIES`. If the value is wrong, sign-in at doors.jakemc.me is refused with "Use the fair server
+address"; the app never opens up. The Host and `TRUSTED_PROXIES` checks stay in the app as a second
+layer.
 
 **Confirm the address `cloudflared` appears from** (on fair-server; prints the gateway, then a sign-in
 check made the same way `cloudflared` connects, which must say `"remote": true`):
 
 ```bash
-(cd /srv/fair-apps/door-control && docker network inspect door-control-net -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' && curl -s -H 'Host: doors.jakemc.me' http://localhost:8480/api/login-info; echo)
+(cd /srv/fair-apps/door-control && docker network inspect door-control-net -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' && curl -s -H 'Host: doors.jakemc.me' http://127.0.0.1:8480/api/login-info; echo)
 ```
 
 If `cloudflared` runs in its own Docker container instead of on fair-server itself, it does not come
 from that gateway: ask before changing `TRUSTED_PROXIES`.
 
-**Check that a fair-network computer is not trusted.** Run this on another computer on the fair network
-(Mac or Linux terminal; on Windows use `curl.exe` in PowerShell), not on fair-server. It must print `403`:
+**Check that a fair-network computer cannot connect.** Run this on another computer on the fair network
+(Mac or Linux terminal; on Windows use `curl.exe` in PowerShell), not on fair-server. It must fail with
+"Connection refused" or a timeout (curl prints `000`), never a number like `200` or `403`:
 
 ```bash
-curl -s -o /dev/null -w "%{http_code}\n" -H 'Host: doors.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://192.168.1.160:8480/api/login-info
+curl -s -m 5 -o /dev/null -w "%{http_code}\n" -H 'Host: doors.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://192.168.1.160:8480/api/login-info
 ```
 
 **If `docker compose up` says the subnet overlaps** another network, list the networks and their
@@ -114,11 +119,12 @@ subnets on fair-server:
 Pick a free `/29` (for example `172.31.249.0/29`), then change it in `compose.yaml` (subnet and
 gateway) and `TRUSTED_PROXIES` in `.env` (`172.31.249.1/32`) in the same pull request, and deploy.
 
-**Optional hardening: publish the port on 127.0.0.1 only.** In `compose.yaml`, `"0.0.0.0:8480:8480"`
-becomes `"127.0.0.1:8480:8480"`. Then nothing on the fair network can reach the app directly (the
-`http://192.168.1.160:8480` sign-in page goes away; everyone uses https://doors.jakemc.me), while
-`cloudflared` on fair-server still connects through `localhost:8480`. The scheduler and Telegram bot are
-not affected. Jake decides; it is not the default.
+**Publishing on the fair network (not recommended).** Changing the one port line in `compose.yaml` from
+`"127.0.0.1:8480:8480"` to `"0.0.0.0:8480:8480"` would show the sign-in page at
+`http://192.168.1.160:8480` again (sign-in itself still only works at doors.jakemc.me). Warning: Docker's
+port forwarder can then make other containers and host traffic arrive from the same gateway address as
+`cloudflared`, so they could fake `CF-Connecting-IP` and the public Host again. Only do this together
+with a secret header that the tunnel adds and the app requires (not built yet).
 
 ### Pin the UniFi console certificate (unifi.cert_sha256)
 
@@ -133,7 +139,7 @@ then says the certificate "does not match"). The block reads the console address
 cd /srv/fair-apps/door-control
 umask 077
 docker compose run --rm -T --no-deps app cat /data/config.json > /tmp/door-config.json
-CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); print("%s:%s" % (u.hostname, u.port or 443))' /tmp/door-config.json)
+CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); h=u.hostname; h="[%s]" % h if ":" in h else h; print("%s:%s" % (h, u.port or 443))' /tmp/door-config.json)
 FP=$(openssl s_client -connect "$CONSOLE" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
 if [ -z "$FP" ]; then echo "Stop: could not read the certificate from $CONSOLE."; rm -f /tmp/door-config.json; exit 1; fi
 echo "UniFi console $CONSOLE certificate SHA-256: $FP"
@@ -246,8 +252,9 @@ Cloudflare Zero Trust -> Networks -> Tunnels -> the fair-server tunnel -> Config
 
 1. **Check first:** note the existing rows (take a screenshot). Make sure there is no `doors.jakemc.me`
    row and no wildcard row (`*.jakemc.me`). If either exists, stop and ask before changing anything.
-2. **Add a public hostname:** Subdomain `doors`, Domain `jakemc.me`, and copy the **Service type and URL
-   style exactly from the awards.jakemc.me row**, with port **8480** (e.g. `HTTP` + `localhost:8480`).
+2. **Add a public hostname:** Subdomain `doors`, Domain `jakemc.me`, Service type copied from the
+   awards.jakemc.me row (`HTTP`), URL **`127.0.0.1:8480`** (write `127.0.0.1`, not `localhost`: the
+   port is published on IPv4 loopback only).
 3. Save. Do not edit any other row; the catch-all rule must stay last.
 4. Open awards.jakemc.me and one other app to confirm they still load.
 

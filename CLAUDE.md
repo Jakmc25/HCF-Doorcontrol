@@ -66,9 +66,13 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
 
 ## Where it runs
 - fair-server (Ubuntu, LAN 192.168.1.160), folder `/srv/fair-apps/door-control` (git checkout), Docker
-  Compose project `door-control`, service `app`, port 8480, volume `door_control_data` at `/data`.
-- Public: https://doors.jakemc.me through the shared Cloudflare tunnel (sign-in required).
-  `http://192.168.1.160:8480` shows the sign-in page only (cookies are always `Secure`; no LAN sign-in).
+  Compose project `door-control`, service `app`, port 8480 published on `127.0.0.1` only, network
+  `door-control-net` (172.31.248.0/29), volume `door_control_data` at `/data`.
+- The dashboard is reachable only through https://doors.jakemc.me (shared Cloudflare tunnel, which
+  connects to `127.0.0.1:8480`; sign-in required) or on fair-server itself. Nothing on the fair network
+  can reach it directly (Jake's decision: no LAN dashboard, Secure cookies). Other containers cannot
+  reach the host loopback, so only cloudflared/fair-server can vouch for `CF-Connecting-IP`. Publishing
+  on `0.0.0.0` again would reopen header spoofing through Docker's port forwarder (README).
   If the internet or tunnel is down: no dashboard; scheduler and Telegram keep running; use the UniFi
   Access app.
 - `.env` (next to compose.yaml, mode 600): `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
@@ -113,7 +117,7 @@ test -e /srv/fair-apps/door-control-backups/pre-docker-commit || git rev-parse H
 git checkout main
 git pull --ff-only
 docker compose build
-CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); print("%s:%s" % (u.hostname, u.port or 443))' config.json)
+CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); h=u.hostname; h="[%s]" % h if ":" in h else h; print("%s:%s" % (h, u.port or 443))' config.json)
 FP=$(openssl s_client -connect "$CONSOLE" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
 if [ -z "$FP" ]; then echo "Stop: could not read the UniFi console certificate from $CONSOLE (nothing changed)."; exit 1; fi
 echo "UniFi console $CONSOLE certificate SHA-256: $FP"
@@ -153,8 +157,8 @@ use the dashboard; that is expected.
 Manual checks after the Cloudflare row: https://doors.jakemc.me shows the sign-in page; Google sign-in
 with a hardincountyfair.org account reaches the dashboard and the email shows in the header; a gmail.com
 account is refused; the door list loads; "Unlock 1 hr" on a test door shows your email in Recent
-activity, then "Back to normal"; Telegram `/doors` answers; `http://192.168.1.160:8480` shows only the
-sign-in page; `curl -s -H 'Host: other.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://127.0.0.1:8480/api/doors`
+activity, then "Back to normal"; Telegram `/doors` answers; `http://192.168.1.160:8480` cannot be reached from
+another fair-network computer (README "Trusted proxies"); `curl -s -H 'Host: other.jakemc.me' -H 'CF-Connecting-IP: 1.2.3.4' http://127.0.0.1:8480/api/doors`
 returns 404; admin sign-in works at doors.jakemc.me; awards.jakemc.me still loads.
 
 ### Rollback to the systemd version
@@ -191,10 +195,10 @@ None open in this app. Follow-ups elsewhere: dev-standards APPS.md needs a Door 
 ## History
 - 2026-11 first version: scheduler, web dashboard (shared HTTP Basic password), Telegram bot, Google
   Calendar sync; systemd service.
-- 1.0.0 (2026-11-27, feature/google-signin, review rounds 1-2 fixed): Google sign-in (hardincountyfair.org) at doors.jakemc.me,
+- 1.0.0 (2026-11-27, feature/google-signin, review rounds 1-3 fixed): Google sign-in (hardincountyfair.org) at doors.jakemc.me,
   break-glass admin password, CSRF, host lockdown, who-did-it activity log (additive `log.user`),
   Docker Compose, CSP + static split, black/prettier, VERSION/CHANGELOG. Review round 1: trusted
-  proxies (round 2: own network door-control-net, gateway /32 only), overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
+  proxies (round 2: own network door-control-net, gateway /32 only; round 3: port on 127.0.0.1 only), overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
 
 ## Team workflow
 - Standards: .claude/standards/ (synced from the dev-standards repo; don't edit here)
