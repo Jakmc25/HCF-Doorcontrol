@@ -1,3 +1,5 @@
+# ROLLBACK ONLY. Since 1.0.0 Door Control runs in Docker Compose (see CLAUDE.md).
+# Never run this service and the container together: both would drive the doors and poll the bot.
 [Unit]
 Description=Fairgrounds Door Control (UniFi Access scheduler, web UI, Telegram bot)
 After=network-online.target

@@ -1145,6 +1145,55 @@ class RepoTests(unittest.TestCase):
         for k in env:
             self.assertIn("%s: ${%s:-}" % (k, k), compose)
 
+    def test_claude_md_pins_shared_modules(self):
+        claude = read("CLAUDE.md")
+        for name, digest in SHARED.items():
+            self.assertRegex(claude, re.escape(name) + r".*" + digest)
+
+    def test_version_everywhere(self):
+        v = read("VERSION").strip()
+        self.assertRegex(v, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(v, web.VERSION)
+        self.assertIn("image: door-control:%s\n" % v, read("compose.yaml"))
+        self.assertEqual(
+            read("README.md").splitlines()[0], "# Fairgrounds Door Control " + v
+        )
+        first = [l for l in read("CHANGELOG.md").splitlines() if l.startswith("## ")][0]
+        self.assertTrue(first.startswith("## " + v + " "), first)
+        self.assertIn("Current version: **%s**" % v, read("CLAUDE.md"))
+        docker = read("Dockerfile")
+        self.assertRegex(docker, r"(?m)^COPY run\.py manage\.py VERSION \./$")
+        self.assertRegex(docker, r"(?m)^COPY doorcontrol \./doorcontrol$")
+        top = {
+            f
+            for f in os.listdir(ROOT)
+            if f.endswith(".py") and f not in ("mock_unifi.py",)
+        }
+        self.assertEqual(
+            top, {"run.py", "manage.py"}, "new top-level file: add it to COPY"
+        )
+
+    def test_readme_documents_sign_everyone_out(self):
+        readme = read("README.md")
+        self.assertIn("Sign everyone out", readme)
+        self.assertIn("rm -f /data/session-secret", readme)
+        self.assertIn("SESSION_DAYS", readme)
+
+    def test_readme_has_no_tailscale_or_password_text(self):
+        readme = read("README.md")
+        for gone in ("Tailscale", "web.password", "tailscale", "port-forward"):
+            self.assertNotIn(gone, readme)
+        for needed in (
+            "If you cannot sign in",
+            "long random password",
+            "UniFi Access app",
+            "GOOGLE_CLIENT_ID",
+            "https://doors.jakemc.me/api/auth/google/callback",
+            "Restore",
+            "docker compose exec app python manage.py",
+        ):
+            self.assertIn(needed, readme)
+
 
 if __name__ == "__main__":
     unittest.main()
