@@ -168,9 +168,9 @@ another fair-network computer (README "Trusted proxies"); `curl -s -H 'Host: oth
 returns 404; admin sign-in works at doors.jakemc.me; awards.jakemc.me still loads.
 
 ### Rollback to the systemd version
-First remove the `doors.jakemc.me` row from the Cloudflare tunnel (that row only), then. Every check
-runs before the container is stopped; after the stop, any failure starts the Docker version again
-(`restore_new`) so the app is never left down:
+First remove the `doors.jakemc.me` row from the Cloudflare tunnel (that row only), then run this block. Every check
+runs before the container is stopped; after the stop, any failure (including the old service not
+starting) starts the Docker version again (`restore_new`) so the app is never left down:
 ```bash
 (set -eE
 cd /srv/fair-apps/door-control
@@ -180,6 +180,7 @@ mkdir -p data
 restore_new() {
   trap - ERR
   echo "Rollback FAILED: starting the Docker version again."
+  sudo systemctl stop door-control || true
   git checkout -q main || true
   docker compose up -d || true
   docker compose ps || true
@@ -189,9 +190,10 @@ docker compose stop
 if [ -e data/doorcontrol.db ]; then mv data/doorcontrol.db "data/doorcontrol.db.before-rollback-$(date +%Y%m%d-%H%M%S)"; fi
 docker compose run --rm -T --no-deps --user 0 -v "$PWD/data":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && chown --reference=/out /out/doorcontrol.db'
 git checkout "$OLD"
-trap - ERR
 sudo systemctl enable --now door-control
 sleep 5
+systemctl is-active --quiet door-control
+trap - ERR
 systemctl status door-control --no-pager)
 ```
 The old version reads the copied database (the `user` column is additive). The volume stays. To go
