@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from .ical import gap_end, wall_to_utc
+from .ical import gap_end, safe_title, wall_to_utc
 from .notify import Notifier
 from .unifi import UnifiError, UnifiUnreachable
 
@@ -202,6 +202,7 @@ class Engine:
         self._failing = {}  # (door id, action) -> {"count", "alerted"}
         self._hand_checked = {}  # door id -> UTC epoch of the last check
         self._reported = set()
+        self._opened = set()
         self._report_lock = threading.Lock()
         self._unifi_failures = 0
         self._last_prune = 0.0
@@ -283,6 +284,7 @@ class Engine:
         quiet_repeat=False,
         until=None,
         note="",
+        alert_note="",
     ):
         """Apply one action to one door. Raises UnifiError on failure. Returns a short
         description. Every door action of every source goes through here: activity log
@@ -327,10 +329,10 @@ class Engine:
                     "recovered", "%s: %s again (%s)." % (label, desc, who)
                 )
         self.db.log(label, action, source, True, logged, user=user)
-        self._status_alert(label, desc, until, who)
+        self._status_alert(label, desc, until, who, alert_note)
         return desc
 
-    def _status_alert(self, label, desc, until, who):
+    def _status_alert(self, label, desc, until, who, extra=""):
         """AC31. An alert problem never affects the door action that already happened."""
         try:
             if isinstance(until, int):
@@ -338,7 +340,9 @@ class Engine:
             end = " until %s" % self._fmt(until) if until else ""
         except Exception:
             end = ""
-        self.notifier.alert("status", "%s: %s%s. By %s." % (label, desc, end, who))
+        self.notifier.alert(
+            "status", "%s: %s%s. By %s.%s" % (label, desc, end, who, extra)
+        )
 
     def _action_failed(self, door, label, action, source, user, who, e, quiet):
         key = (door["id"], action)
@@ -519,7 +523,7 @@ class Engine:
                     ("calendar", w["uid"], p),
                     "calendar",
                     'Calendar event "%s" (organizer %s): %s. That part opens no door.'
-                    % (w["title"][:120], w["organizer"] or "none", p),
+                    % (safe_title(w["title"]), w["organizer"] or "none", p),
                 )
             if ids:
                 out.append(
@@ -529,11 +533,51 @@ class Engine:
                         "source": "calendar",
                         "title": w["title"],
                         "end_action": self.calendar.end_action,
-                        "door_ids": ids,
+                        "door_ids": set(ids),
                         "organizer": w["organizer"],
+                        "uid": w["uid"],
                     }
                 )
-        return out
+        self._cap_chains(out, doors)
+        return [w for w in out if w["door_ids"]]
+
+    def _cap_chains(self, wins, doors):
+        """Review S11: back-to-back or overlapping calendar windows may not hold one door
+        unlocked without a break for longer than the calendar cap (max_window_hours, at
+        most 24, plus the event buffers). Chains are built from every accepted calendar
+        window for the door (refused ones included), so the answer for a running window
+        does not depend on how far back the engine looks: any window that ends more than
+        the cap after its chain started opens nothing on that door (logged and alerted).
+        A daily all-day event therefore opens the door on its first day only."""
+        cal = self.calendar
+        limit = timedelta(hours=cal.max_window_hours) + cal.before + cal.after
+        names = {d["id"]: _door_label(d) for d in doors}
+        for did in sorted({i for w in wins for i in w["door_ids"]}):
+            chain_start = held_until = None
+            for w in sorted(
+                (w for w in wins if did in w["door_ids"]),
+                key=lambda w: (w["start"], w["end"]),
+            ):
+                if held_until is None or w["start"] > held_until:
+                    chain_start = w["start"]
+                held_until = max(held_until or w["end"], w["end"])
+                if w["end"] - chain_start <= limit:
+                    continue
+                w["door_ids"].discard(did)
+                self._report(
+                    ("calendar", "chain", did, w["uid"], w["start"].timestamp()),
+                    "calendar",
+                    'Calendar event "%s" (organizer %s) on %s follows other events with '
+                    "no break and would keep %s unlocked for more than %g hours in a "
+                    "row. It opens nothing on that door."
+                    % (
+                        safe_title(w["title"]),
+                        w["organizer"] or "none",
+                        self._fmt(w["start"]),
+                        names.get(did, did),
+                        limit.total_seconds() / 3600.0,
+                    ),
+                )
 
     def upcoming(self, days=7):
         now_local = self.now()
@@ -651,46 +695,87 @@ class Engine:
 
     def _door_tick(self, d, wins, now, trusted):
         mine = [w for w in wins if d["id"] in w["door_ids"]]
-        active = [
-            w
-            for w in mine
-            if w["start"] <= now < w["end"] and (trusted or w["source"] != "calendar")
-        ]
+        now_ts = now.timestamp()
+        live = [w for w in mine if w["start"] <= now < w["end"]]
+        sched_active = [w for w in live if w["source"] != "calendar"]
         st = self.db.get_state(d["id"]) or {}
+        if trusted:
+            cal_active = [w for w in live if w["source"] == "calendar"]
+            cal_end = max((w["end"].timestamp() for w in cal_active), default=None)
+        else:
+            # Review R1: calendar not read yet (startup) or stale. No new calendar
+            # window, and the calendar hold recorded earlier is kept as it is (never
+            # shortened, never extended), whatever source the door's state names.
+            cal_active = []
+            cal_end = st.get("cal_ends_at")
+            if cal_end is None and st.get("source") == "calendar":
+                cal_end = st.get("ends_at")  # row written before cal_ends_at existed
+            if cal_end is not None and now_ts >= cal_end:
+                cal_end = None
+        active = sched_active + cal_active
         if (st.get("applied") or "free") != "unlock":
             if active:
                 self._start_window(d, active, now)
             return
-        if active:
-            ends = max(w["end"] for w in active).timestamp()
-            src = (
-                "schedule"
-                if any(w["source"] == "schedule" for w in active)
-                else "calendar"
-            )
-            if st.get("ends_at") != ends or st.get("source") != src:
-                self.db.update_state(d["id"], ends_at=ends, source=src)
-            self._hand_check(d, st, now)
-            return
-        if (
-            st.get("source") == "calendar"
-            and not trusted
-            and st.get("ends_at")
-            and now.timestamp() < st["ends_at"]
-        ):
-            # Calendar not read yet or stale: leave the door as it is until the end
-            # recorded when it opened (never extended, never ended early).
+        if active or cal_end is not None:
+            ends = max([w["end"].timestamp() for w in sched_active] + [cal_end or 0])
+            src = "schedule" if sched_active else "calendar"
+            if (
+                st.get("ends_at") != ends
+                or st.get("source") != src
+                or st.get("cal_ends_at") != cal_end
+            ):
+                self.db.update_state(
+                    d["id"], ends_at=ends, source=src, cal_ends_at=cal_end
+                )
+            self._opened_alerts(d, cal_active)
             self._hand_check(d, st, now)
             return
         self._end_window(d, st, mine, now)
 
+    @staticmethod
+    def _opened_key(d, w):
+        return ("opened", d["id"], w.get("uid"), w["start"].timestamp())
+
+    def _opened_alerts(self, d, cal_windows):
+        """Review S12: the organizer allowlist only proves what the feed says, so every
+        calendar window that opens a door is alerted with its title and UID."""
+        for w in cal_windows:
+            key = self._opened_key(d, w)
+            with self._report_lock:
+                if key in self._opened:
+                    continue
+                if len(self._opened) > 10000:
+                    self._opened.clear()
+                self._opened.add(key)
+            text = (
+                'Calendar event "%s" (UID %s, organizer %s) holds %s unlocked until %s.'
+                % (
+                    safe_title(w["title"]),
+                    safe_title(w.get("uid") or "none", 80),
+                    w["organizer"] or "none",
+                    _door_label(d),
+                    self._fmt(w["end"]),
+                )
+            )
+            log.info(text)
+            self.notifier.alert("status", text, key=key)
+
     def _start_window(self, d, active, now):
         sched = [w for w in active if w["source"] == "schedule"]
+        cal = [w for w in active if w["source"] == "calendar"]
         w0 = (sched or active)[0]
         ends = max(w["end"] for w in active)
+        alert_note = ""
         if w0["source"] == "calendar":
             source, user = "calendar: " + w0["title"], "calendar:" + w0["organizer"]
             note = ' (event "%s")' % w0["title"]
+            # Review S12: the status alert names the event and its UID; the other
+            # calendar windows (if any) get their own alert below.
+            alert_note = ' Event "%s" (UID %s).' % (
+                safe_title(w0["title"]),
+                safe_title(w0.get("uid") or "none", 80),
+            )
         else:
             source, user, note = "scheduler: " + w0["title"], "", ""
         self.door_action(
@@ -701,6 +786,7 @@ class Engine:
             quiet_repeat=True,
             until=ends,
             note=note,
+            alert_note=alert_note,
         )
         end_action = (
             "keep_lock"
@@ -715,8 +801,13 @@ class Engine:
             since=now.timestamp(),
             source="schedule" if sched else "calendar",
             ends_at=ends.timestamp(),
+            cal_ends_at=max((w["end"].timestamp() for w in cal), default=None),
         )
         self._hand_checked[d["id"]] = now.timestamp()
+        if alert_note:
+            with self._report_lock:
+                self._opened.add(self._opened_key(d, w0))
+        self._opened_alerts(d, cal)
 
     def _end_action(self, st, mine, now):
         """Chosen when the window ends, from the windows active just before it ended."""
@@ -745,9 +836,12 @@ class Engine:
             self.db.set_state(d["id"], "free")
             return
         # Only touch the door if it is still in the state we put it in; if someone
-        # changed it by hand since, leave their change alone.
-        rule = self.client.lock_rule(d["id"]) or {}
-        if rule.get("type") == "keep_unlock":
+        # changed it by hand since, leave their change alone. If the door cannot be
+        # read, keep the state and try again next tick (review Q1/Q2).
+        rule = self._read_rule(d, "at the end of its window")
+        if rule is None:
+            return
+        if rule["type"] == "keep_unlock":
             self.door_action(
                 d,
                 self._end_action(st, mine, now),
@@ -766,11 +860,66 @@ class Engine:
         last = self._hand_checked.get(d["id"])
         if last is not None and now.timestamp() - last < self.hand_check_seconds:
             return
+        rule = self._read_rule(d, "while it is held unlocked")
+        if rule is None:
+            return  # could not read: asked again next tick
         self._hand_checked[d["id"]] = now.timestamp()
-        rule = self.client.lock_rule(d["id"]) or {}
-        if rule.get("type") != "keep_unlock":
+        if rule["type"] != "keep_unlock":
             self._hand_changed(d, rule)
             self.db.update_state(d["id"], hand_alerted=1)
+
+    def _read_rule(self, d, when):
+        """The door's current lock rule, or None when UniFi gave no clear answer (an
+        empty or unknown reply is never taken as a change by hand: review Q1). Both an
+        unclear answer and a UniFi error write one activity row per outage and alert
+        after failures_before_alert tries; UniFi errors are raised again."""
+        label = _door_label(d)
+        key = (d["id"], "read")
+        try:
+            rule = self.client.lock_rule(d["id"])
+        except UnifiError as e:
+            self._read_failed(d, label, key, when, str(e))
+            raise
+        t = rule.get("type") if isinstance(rule, dict) else None
+        if not isinstance(t, str) or not t.strip():
+            self._read_failed(d, label, key, when, "UniFi gave no lock rule")
+            return None
+        f = self._failing.pop(key, None)
+        if f is not None:
+            self.db.log(
+                label,
+                "read door",
+                "scheduler",
+                True,
+                "door could be read again after %d failed tries" % f["count"],
+            )
+            if f["alerted"]:
+                self.notifier.alert(
+                    "recovered", "%s can be read again (%s)." % (label, t.strip())
+                )
+        return {**rule, "type": t.strip()}
+
+    def _read_failed(self, d, label, key, when, why):
+        f = self._failing.get(key)
+        if f is None:
+            f = self._failing[key] = {"count": 0, "alerted": False}
+            self.db.log(
+                label,
+                "read door",
+                "scheduler",
+                False,
+                "could not read the door %s (%s); left as is, retrying" % (when, why),
+            )
+        f["count"] += 1
+        if f["count"] >= self.failures_before_alert and not f["alerted"]:
+            f["alerted"] = True
+            self.notifier.alert(
+                "door_error",
+                "Door problem: could not read the door %s %s (%s). Door Control leaves "
+                "it as it is and tries again every %d s."
+                % (label, when, why, self.tick_seconds),
+                key=("door", d["id"], "read"),
+            )
 
     def _hand_changed(self, d, rule):
         label = _door_label(d)

@@ -19,7 +19,6 @@
     "buffer_before_min": 0,
     "buffer_after_min": 0,
     "end_action": "reset",
-    "allowed_organizers": [],
     "calendar_email": "",
     "stale_minutes": 60,
     "max_window_hours": 24

@@ -62,6 +62,21 @@ def warn_no_organizers(cal_cfg, notifier, env=None):
     return False
 
 
+def warn_dev_mode(mode, notifier):
+    """Review S17: plain http to the console is for a local fake controller only; if it
+    is ever switched on, the alert chats hear about it at startup, not just the log."""
+    if mode != "development":
+        return False
+    notifier.alert(
+        "scheduler",
+        "Door Control started with DOORCONTROL_DEV_ALLOW_HTTP=1: it talks to the door "
+        "console over plain http without a certificate check. This is for testing "
+        "with the fake controller only; remove it from the server's settings.",
+        key=("startup", "dev-http"),
+    )
+    return True
+
+
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     # DATA_DIR holds config.json and the database (/data in Docker, data/ locally).
@@ -127,6 +142,7 @@ def main(argv=None):
         Calendar(cal_cfg, tz, notifier=notifier) if cal_cfg.get("ical_url") else None
     )
     warn_no_organizers(cal_cfg, notifier)
+    warn_dev_mode(mode, notifier)
     engine = Engine(cfg, DB(db_path), client, calendar, notifier)
 
     if calendar:

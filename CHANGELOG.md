@@ -33,8 +33,20 @@ Safety fixes from the 2026-11-27 audit, and Telegram alerts.
   sign-ins capped separately; Docker log rotation; container logs in local time; new deploy block
   (Docker check, backup, pin, healthy wait, automatic return to the previous version) and rollback
   block (restores config and sign-in files too, refuses to overwrite newer data twice).
-- Additive migration: `door_state.source/ends_at/hand_alerted`, `log.kind`, table `kv`. No new `.env`
-  lines. New optional `config.json` keys (see `config.example.json`).
+- **Review round 1.** When a schedule and a calendar event overlap on a door, a stale or not-yet-read
+  calendar never shortens the event's hold (its end is kept separately). An empty or unclear answer from
+  UniFi is never taken as a change by hand: it is retried and alerted ("could not read the door"), and a
+  failed read at a window's end writes one activity row per outage. Calendar events back to back may
+  not keep a door unlocked for more than 24 hours without a break, and `max_window_hours` is capped at
+  24; buffers no longer make all-day events too long. Every calendar event that opens a door is alerted
+  with its title and UID. Links are removed from event titles in alerts. Chats that are not allowed are
+  answered before the command limit (at most once a minute). An alert at startup when
+  `DOORCONTROL_DEV_ALLOW_HTTP` is set. A feed starting with a byte order mark is read. The deploy block
+  also runs when the app is down, the automatic return waits for healthy, and only the newest 10 deploy
+  and rollback folders are kept; the rollback block checks the typed folder name.
+- Additive migration: `door_state.source/ends_at/hand_alerted/cal_ends_at`, `log.kind`, table `kv`. No
+  new `.env` lines. New optional `config.json` keys (see `config.example.json`; `allowed_organizers` is
+  not in it on purpose, see README).
 
 ## 1.0.0 (2026-11-27)
 First numbered release.

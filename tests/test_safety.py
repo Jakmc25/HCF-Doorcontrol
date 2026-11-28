@@ -750,6 +750,7 @@ class Attribution(EngineCase):
         self.assertIn('"Unlock: Office"', row["detail"])
         (status,) = self.rec.of("status")
         self.assertIn("calendar:" + JAKE, status[1])
+        self.assertIn('Event "Unlock: Office" (UID u1).', status[1])  # review S12
         self.assertIn("until Mon 9:00 PM", status[1])
 
 
@@ -1318,8 +1319,9 @@ class Repo(unittest.TestCase):
     def test_config_example_has_new_keys(self):
         cfg = json.loads(read("config.example.json"))
         self.assertIn("cert_sha256", cfg["unifi"])
+        # Review R2: an empty list would count as set and switch off the admin fallback.
+        self.assertNotIn("allowed_organizers", cfg["calendar"])
         for k in (
-            "allowed_organizers",
             "calendar_email",
             "stale_minutes",
             "max_window_hours",
@@ -1336,6 +1338,352 @@ class Repo(unittest.TestCase):
     def test_no_dev_escape_in_compose(self):
         self.assertNotIn("DOORCONTROL_DEV_ALLOW_HTTP", read("compose.yaml"))
         self.assertNotIn("DOORCONTROL_DEV_ALLOW_HTTP", read("Dockerfile"))
+
+
+# ---------------------------------------------------------------- review round 1
+def read_rows(eng, action):
+    return [r for r in eng.db.recent_log(200) if r["action"] == action]
+
+
+class OverlapHold(unittest.TestCase):
+    """Review R1: schedule 08-17 and calendar event 16-20 on the same door."""
+
+    EVENT = vevent(
+        "Unlock: Event Center",
+        uid="ev",
+        start="TZID=America/New_York:20270906T160000",
+        end="TZID=America/New_York:20270906T200000",
+    )
+
+    def setUp(self):
+        self.path = os.path.join(tempfile.mkdtemp(), "t.db")
+        self.clock = FakeClock()
+        self.rec = Recorder()
+        self.cal = calendar(vcal(self.EVENT), self.rec, clock=self.clock)
+        self.mock, srv, self.eng = build(self.cal, self.rec, db_path=self.path)
+        self.addCleanup(srv.shutdown)
+        self.eng.db.add_schedule(sched(doors=["d1"], start="08:00", end="17:00"))
+
+    def tick_at(self, eng, h, m=0):
+        eng.at(2027, 9, 6, h, m)
+        eng.tick()
+
+    def test_stale_feed_keeps_event_end(self):
+        self.tick_at(self.eng, 16, 30)
+        st = self.eng.db.get_state("d1")
+        self.assertEqual(st["source"], "schedule")
+        self.assertEqual(
+            st["cal_ends_at"], datetime(2027, 9, 6, 20, tzinfo=TZ).timestamp()
+        )
+        self.clock.advance(61 * 60)
+        self.assertEqual(self.cal.state(), "stale")
+        n = len(self.mock.calls)
+        for h, m in ((16, 45), (17, 1), (18, 0), (19, 59)):
+            self.tick_at(self.eng, h, m)
+            self.assertEqual(
+                put_types(self.mock, "d1", n), [], "held at %d:%02d" % (h, m)
+            )
+        self.assertEqual(
+            self.eng.db.get_state("d1")["ends_at"],
+            datetime(2027, 9, 6, 20, tzinfo=TZ).timestamp(),
+            "stored end never lowered",
+        )
+        self.tick_at(self.eng, 20, 1)
+        self.assertEqual(put_types(self.mock, "d1", n), ["reset"])
+
+    def test_restart_before_first_fetch_keeps_event_end(self):
+        self.tick_at(self.eng, 16, 30)
+        # Restart: new engine on the same database, calendar not read yet.
+        rec2 = Recorder()
+        cal2 = calendar(None, rec2)
+        self.assertEqual(cal2.state(), "unknown")
+        mock2, srv2, eng2 = build(cal2, rec2, db_path=self.path)
+        self.addCleanup(srv2.shutdown)
+        mock2.set_by_hand("d1", "keep_unlock")
+        for h, m in ((17, 1), (19, 30)):
+            self.tick_at(eng2, h, m)
+        self.assertEqual(put_types(mock2, "d1"), [], "not reset at the schedule's end")
+        self.tick_at(eng2, 20, 1)
+        self.assertEqual(put_types(mock2, "d1"), ["reset"])
+
+    def test_trusted_calendar_without_the_event_ends_with_the_schedule(self):
+        self.tick_at(self.eng, 16, 30)
+        self.cal.load_text(vcal())  # event removed, feed fresh
+        n = len(self.mock.calls)
+        self.tick_at(self.eng, 17, 1)
+        self.assertEqual(put_types(self.mock, "d1", n), ["reset"])
+
+    def test_calendar_joining_a_schedule_hold_is_alerted_with_uid(self):
+        self.tick_at(self.eng, 16, 30)
+        opened = [t for _, t, _ in self.rec.of("status") if "UID ev" in t]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("Event Center", opened[0])
+        self.tick_at(self.eng, 16, 31)
+        self.assertEqual(
+            len([t for _, t, _ in self.rec.of("status") if "UID ev" in t]), 1
+        )
+
+
+class UnclearRule(EngineCase):
+    """Review Q1/Q2: only a real, different lock rule is a change by hand."""
+
+    def held(self):
+        eng = self.make(vcal())
+        eng.db.add_schedule(sched(doors=["d2"], start="18:00", end="20:00"))
+        eng.at(2027, 9, 6, 19)
+        eng.tick()
+        self.assertEqual(self.mock.rules["d2"]["type"], "keep_unlock")
+        return eng
+
+    def test_end_window_empty_answers_retry_and_alert(self):
+        eng = self.held()
+        n = len(self.mock.calls)
+        for i, bad in enumerate(({}, None, {"type": ""}, {"type": None}, {"x": 1})):
+            self.mock.rules["d2"] = bad
+            eng.at(2027, 9, 6, 20, 1 + i)
+            eng.tick()
+            self.assertEqual(put_types(self.mock, "d2", n), [], "door left alone")
+            self.assertEqual(eng.db.get_state("d2")["applied"], "unlock", "retried")
+        self.assertEqual(self.rec.of("hand_change"), [])
+        (alert,) = [
+            c for c in self.rec.of("door_error") if c[2] == ("door", "d2", "read")
+        ]
+        self.assertIn("could not read the door", alert[1])
+        rows = read_rows(eng, "read door")
+        self.assertEqual(len(rows), 1, "one row per outage")
+        self.assertFalse(rows[0]["ok"])
+        self.mock.rules["d2"] = {"type": "keep_unlock", "ended_time": 0}
+        eng.at(2027, 9, 6, 20, 10)
+        eng.tick()
+        self.assertEqual(put_types(self.mock, "d2", n), ["reset"])
+        self.assertEqual(eng.db.get_state("d2")["applied"], "free")
+        self.assertEqual(len(read_rows(eng, "read door")), 2)
+        self.assertTrue(
+            any("can be read again" in t for _, t, _ in self.rec.of("recovered"))
+        )
+
+    def test_end_window_real_other_rule_is_hand_change(self):
+        eng = self.held()
+        self.mock.set_by_hand("d2", "keep_lock")
+        n = len(self.mock.calls)
+        eng.at(2027, 9, 6, 20, 1)
+        eng.tick()
+        self.assertEqual(put_types(self.mock, "d2", n), [])
+        self.assertEqual(len(self.rec.of("hand_change")), 1)
+        self.assertEqual(eng.db.get_state("d2")["applied"], "free")
+
+    def test_hand_check_empty_answer_retried_not_hand_change(self):
+        eng = self.held()
+        self.mock.rules["d2"] = {}
+        eng.at(2027, 9, 6, 19, 6)  # hand check due
+        eng.tick()
+        gets = lambda: len(
+            [c for c in self.mock.calls if c[0] == "GET" and "/d2/lock_rule" in c[1]]
+        )
+        g = gets()
+        eng.at(2027, 9, 6, 19, 7)  # inside the 5 minutes: asked again anyway
+        eng.tick()
+        self.assertEqual(gets(), g + 1)
+        self.assertEqual(self.rec.of("hand_change"), [])
+        self.assertFalse(eng.db.get_state("d2")["hand_alerted"])
+        self.assertTrue(
+            any("could not read the door" in t for _, t, _ in self.rec.of("door_error"))
+        )
+        self.mock.set_by_hand("d2", "lock_now")
+        eng.at(2027, 9, 6, 19, 8)
+        eng.tick()
+        self.assertEqual(len(self.rec.of("hand_change")), 1)
+        self.assertTrue(eng.db.get_state("d2")["hand_alerted"])
+
+    def test_unifi_error_reading_at_end_one_row_per_outage(self):
+        eng = self.held()
+        self.mock.fail_paths = [("GET", r"/api/v1/developer/doors/d2/lock_rule")]
+        for m in (1, 2, 3):
+            eng.at(2027, 9, 6, 20, m)
+            with self.assertLogs("doorcontrol", "WARNING"):
+                eng.tick()
+        rows = read_rows(eng, "read door")
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["ok"])
+        self.assertEqual(eng.db.get_state("d2")["applied"], "unlock")
+        self.mock.fail_paths = []
+        eng.at(2027, 9, 6, 20, 4)
+        eng.tick()
+        self.assertEqual(eng.db.get_state("d2")["applied"], "free")
+        self.assertEqual([r["ok"] for r in read_rows(eng, "read door")], [1, 0])
+
+
+class Chains(EngineCase):
+    """Review S11 (and R3): no calendar hold over 24 h without a break."""
+
+    def allday_daily(self, **cal_cfg):
+        ev = vevent(
+            "Unlock: Office",
+            uid="daily",
+            start="VALUE=DATE:20270906",
+            end="VALUE=DATE:20270907",
+            extra=["RRULE:FREQ=DAILY"],
+        )
+        return self.make(vcal(ev), cal_cfg=cal_cfg)
+
+    def test_daily_all_day_rrule_does_not_hold_for_days(self):
+        eng = self.allday_daily()
+        eng.at(2027, 9, 6, 12)
+        eng.tick()
+        self.assertEqual(self.mock.rules["d2"]["type"], "keep_unlock")
+        n = len(self.mock.calls)
+        eng.at(2027, 9, 7, 0, 1)
+        eng.tick()
+        self.assertEqual(put_types(self.mock, "d2", n), ["reset"])
+        for day in (7, 8, 9, 12):
+            eng.at(2027, 9, day, 12)
+            eng.tick()
+            self.assertEqual(self.mock.rules["d2"]["type"], "schedule", day)
+        texts = [t for _, t, _ in self.rec.of("calendar")]
+        self.assertTrue(any("more than 24 hours in a row" in t for t in texts))
+
+    def test_all_day_with_buffers_accepted(self):
+        eng = self.make(
+            vcal(
+                vevent(
+                    "Unlock: Office",
+                    uid="ad",
+                    start="VALUE=DATE:20270906",
+                    end="VALUE=DATE:20270907",
+                )
+            ),
+            cal_cfg={"buffer_before_min": 30, "buffer_after_min": 30},
+        )
+        eng.at(2027, 9, 6, 12)
+        eng.tick()
+        self.assertEqual(self.mock.rules["d2"]["type"], "keep_unlock")
+
+    def test_back_to_back_timed_events_capped(self):
+        ev = lambda uid, s, e: vevent(
+            "Unlock: Office",
+            uid=uid,
+            start="TZID=America/New_York:" + s,
+            end="TZID=America/New_York:" + e,
+        )
+        eng = self.make(
+            vcal(
+                ev("a", "20270906T200000", "20270907T080000"),
+                ev("b", "20270907T080000", "20270907T200000"),
+                ev("c", "20270907T200000", "20270908T060000"),
+                ev("other", "20270907T200000", "20270907T230000"),
+            )
+        )
+        eng.at(2027, 9, 7, 12)
+        eng.tick()
+        self.assertEqual(
+            self.mock.rules["d2"]["type"], "keep_unlock", "24 h is allowed"
+        )
+        n = len(self.mock.calls)
+        eng.at(2027, 9, 7, 20, 1)
+        eng.tick()
+        self.assertEqual(put_types(self.mock, "d2", n), ["reset"], "a break after 24 h")
+        self.assertEqual(self.mock.rules["d1"]["type"], "schedule")
+        texts = [t for _, t, _ in self.rec.of("calendar")]
+        self.assertTrue(any("more than 24 hours in a row" in t for t in texts))
+
+    def test_max_window_hours_clamped(self):
+        self.assertEqual(calendar(max_window_hours=72).max_window_hours, 24)
+        self.assertEqual(calendar(max_window_hours=0).max_window_hours, 1)
+        self.assertEqual(calendar(max_window_hours=12).max_window_hours, 12)
+
+
+class SmallFixes(unittest.TestCase):
+    def test_titles_in_refusal_alerts_have_no_links(self):
+        rec = Recorder()
+        c = calendar(
+            vcal(
+                vevent(
+                    "Unlock: Office see https://evil.example/x?y=1 or www.bad.example",
+                    organizer="stranger@example.com",
+                )
+            ),
+            rec,
+        )
+        with self.assertLogs("doorcontrol", "WARNING"):
+            windows(c)
+        (alert,) = rec.of("calendar")
+        self.assertNotIn("evil.example", alert[1])
+        self.assertNotIn("bad.example", alert[1])
+        self.assertIn("[link]", alert[1])
+
+    def test_feed_with_byte_order_mark(self):
+        c = calendar("﻿" + vcal(vevent("Unlock: Office")))
+        self.assertEqual(len(windows(c)), 1)
+
+    def test_dev_http_alert_at_startup(self):
+        rec = Recorder()
+        self.assertFalse(app.warn_dev_mode("pinned", rec))
+        self.assertEqual(rec.calls, [])
+        self.assertTrue(app.warn_dev_mode("development", rec))
+        (call,) = rec.calls
+        self.assertIn("DOORCONTROL_DEV_ALLOW_HTTP", call[1])
+
+    def test_docs_for_r2_r4_q4_s12(self):
+        readme = read("README.md")
+        for text in (
+            '"allowed_organizers": []',
+            "13 years",
+            "40 Telegram messages a minute",
+            "who can add or edit events on that calendar",
+        ):
+            self.assertIn(text, readme)
+
+
+class DeployBlocks(unittest.TestCase):
+    def test_deploy_runs_when_app_down_and_restore_waits(self):
+        block = section_block(read("CLAUDE.md"), "### Deploy\n")
+        self.assertNotIn("Stop: Door Control is not running", block)
+        self.assertIn("deploying anyway", block)
+        restore = block.split("restore_prev() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("Health.Status", restore)
+
+    def prune_line(self, heading):
+        block = section_block(read("CLAUDE.md"), heading)
+        (line,) = [l for l in block.splitlines() if l.startswith("for P in deploy")]
+        return line
+
+    def test_prune_keeps_newest_10(self):
+        for heading in ("### Deploy\n", "### Rollback to the previous Docker version"):
+            d = tempfile.mkdtemp()
+            for i in range(14):
+                os.mkdir(os.path.join(d, "deploy-20270101-%06d" % i))
+                os.mkdir(os.path.join(d, "pre-rollback-20270101-%06d" % i))
+            os.mkdir(os.path.join(d, "other"))
+            subprocess.run(
+                ["bash", "-c", 'BKROOT="$1"; ' + self.prune_line(heading), "x", d],
+                check=True,
+            )
+            left = sorted(os.listdir(d))
+            self.assertEqual(len([x for x in left if x.startswith("deploy-")]), 10)
+            self.assertEqual(len([x for x in left if x.startswith("pre-rollback")]), 10)
+            self.assertIn("deploy-20270101-000013", left)
+            self.assertNotIn("deploy-20270101-000003", left)
+            self.assertIn("other", left)
+
+    def test_rollback_name_checked(self):
+        block = section_block(
+            read("CLAUDE.md"), "### Rollback to the previous Docker version"
+        )
+        (line,) = [l for l in block.splitlines() if l.startswith('[[ "$NAME"')]
+        self.assertLess(block.index(line), block.index("BK=$BKROOT/$NAME"))
+        for name, ok in (
+            ("deploy-20261201-093000", True),
+            ("../deploy-20261201-093000", False),
+            ("deploy-1/../../etc", False),
+            ("deploy-", False),
+            ("", False),
+        ):
+            r = subprocess.run(
+                ["bash", "-c", 'NAME="$1"; ' + line + "; echo ok", "x", name],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r.stdout.strip() == "ok", ok, name)
 
 
 if __name__ == "__main__":

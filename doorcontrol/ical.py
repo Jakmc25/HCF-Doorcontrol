@@ -50,6 +50,17 @@ def check_url(url):
         )
 
 
+_URL = re.compile(r"(?i)\b(?:[a-z][a-z0-9+.-]*://|www\.)\S*")
+
+
+def safe_title(text, limit=120):
+    """An event title (or UID) for an alert or log line: links removed (review S15),
+    control characters dropped, shortened."""
+    t = _URL.sub("[link]", str(text or ""))
+    t = "".join(c if c.isprintable() else " " for c in t).strip()
+    return t[:limit]
+
+
 # ---- time helpers (also used by the engine for schedules) ----
 def wall_to_utc(dt):
     """Aware local wall time -> UTC, or None when that wall time does not exist (the
@@ -489,7 +500,10 @@ class Calendar:
         self.after = timedelta(minutes=int(cfg.get("buffer_after_min", 0)))
         self.end_action = cfg.get("end_action", "reset")
         self.stale_seconds = max(1.0, float(cfg.get("stale_minutes", 60))) * 60
-        self.max_window_hours = max(1.0, float(cfg.get("max_window_hours", 24)))
+        # Never more than 24 hours, whatever config.json says (review S11).
+        self.max_window_hours = min(
+            24.0, max(1.0, float(cfg.get("max_window_hours", 24)))
+        )
         self.calendar_email = str(cfg.get("calendar_email") or "").strip().lower()
         self.tz = tz
         self.notifier = notifier or Notifier()
@@ -532,6 +546,7 @@ class Calendar:
     def load_text(self, text):
         """Replace the events only with a complete calendar that parses; otherwise keep
         the last good events and raise FeedError."""
+        text = (text or "").lstrip("\ufeff")  # a UTF-8 byte order mark (review Q3)
         check_feed(text)
         events = _parse_events(text, self.tz)
         with self._lock:
@@ -609,9 +624,8 @@ class Calendar:
             if len(self._reported) > 10000:
                 self._reported.clear()
             self._reported.add(key)
-        title = (e.get("title") or "").strip()
         text = 'Calendar event "%s" (organizer %s) %s. It opens no door.' % (
-            title[:120],
+            safe_title(e.get("title")),
             e.get("organizer") or "none",
             reason,
         )
@@ -644,9 +658,12 @@ class Calendar:
             days, dur = event_span(e)
         except ValueError as ex:
             return "was skipped: %s" % ex, False
-        hours = (days * 24.0 if days else dur.total_seconds() / 3600.0) + (
-            self.before + self.after
-        ).total_seconds() / 3600.0
+        # All-day events: one day is the cap; buffers are not counted (review R3).
+        hours = (
+            days * 24.0
+            if days
+            else (dur + self.before + self.after).total_seconds() / 3600.0
+        )
         if hours > self.max_window_hours:
             return (
                 "is longer than the %g-hour limit (one all-day event per day)"

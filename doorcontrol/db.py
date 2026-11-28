@@ -76,6 +76,10 @@ class DB:
             self.conn.execute(
                 "ALTER TABLE door_state ADD COLUMN hand_alerted INTEGER NOT NULL DEFAULT 0"
             )
+        if "cal_ends_at" not in cols:
+            # 1.1.0 review R1: end of the calendar window(s) holding the door (UTC epoch),
+            # kept apart from ends_at so a stale or unread calendar never shortens it.
+            self.conn.execute("ALTER TABLE door_state ADD COLUMN cal_ends_at REAL")
 
     # ---- schedules ----
     @staticmethod
@@ -158,12 +162,13 @@ class DB:
         since=None,
         source=None,
         ends_at=None,
+        cal_ends_at=None,
     ):
         with self.lock:
             self.conn.execute(
                 "INSERT OR REPLACE INTO door_state"
-                "(door_id,applied,end_action,since,reason,source,ends_at,hand_alerted) "
-                "VALUES(?,?,?,?,?,?,?,0)",
+                "(door_id,applied,end_action,since,reason,source,ends_at,hand_alerted,"
+                "cal_ends_at) VALUES(?,?,?,?,?,?,?,0,?)",
                 (
                     door_id,
                     applied,
@@ -172,12 +177,13 @@ class DB:
                     reason,
                     source,
                     ends_at,
+                    cal_ends_at,
                 ),
             )
             self.conn.commit()
 
     def update_state(self, door_id, **cols):
-        allowed = {"source", "ends_at", "hand_alerted"}
+        allowed = {"source", "ends_at", "hand_alerted", "cal_ends_at"}
         if not cols or set(cols) - allowed:
             raise ValueError("update_state: unknown column")
         names = sorted(cols)

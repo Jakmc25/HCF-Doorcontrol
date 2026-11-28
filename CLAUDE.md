@@ -107,7 +107,7 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   cert_sha256 is not set it pins the certificate before the restart).
 - Daily backups: `/data/backups` inside the volume (14 kept, mode 600; README "Backup and restore").
   Deploy and rollback backups: `/srv/fair-apps/door-control-backups` (folders `deploy-*`,
-  `pre-rollback-*`, mode 700).
+  `pre-rollback-*`, mode 700; the newest 10 of each are kept).
 - Docker Engine on fair-server must be version 28 or newer (older versions could let other machines on
   the same network reach ports published on 127.0.0.1). The deploy block checks it; to check by hand:
   ```bash
@@ -121,19 +121,21 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   never root).
 
 ### Deploy
-In order: checks Docker >= 28, that the old systemd service is not running and that the app runs;
-records the previous commit and backs up the database, config.json, accounts.json and session-secret
+In order: checks Docker >= 28 and that the old systemd service is not running (if the app is not
+running it says so and goes on: that is the recovery case); records the previous commit and backs up the database, config.json, accounts.json and session-secret
 to a new `deploy-<time>` folder (nothing has changed yet if any of this fails); pins the UniFi
 certificate if it is not pinned (before any restart, so the new version never refuses to start); pulls
 and builds while the old version keeps running; starts the new version and waits up to 90 s for
-healthy. Any failure after the start puts the previous commit (and its image) back and starts it.
+healthy. Any failure after the start puts the previous commit (and its image) back, starts it and
+waits up to 90 s for it to be healthy. At the end only the newest 10 `deploy-*` and 10 `pre-rollback-*`
+folders are kept.
 ```bash
 (set -eE
 cd /srv/fair-apps/door-control
 V=$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)
 if ! [ "${V%%.*}" -ge 28 ] 2>/dev/null; then echo "Stop: Docker Engine ${V:-unknown} is older than 28 (or not reachable). Nothing changed. Tell Jake."; exit 1; fi
 if systemctl is-active --quiet door-control; then echo "Stop: the old systemd service is running; use the first-move block. Nothing changed."; exit 1; fi
-test -n "$(docker compose ps --status running -q app)" || { echo "Stop: Door Control is not running here. Nothing changed."; exit 1; }
+if [ -z "$(docker compose ps --status running -q app)" ]; then echo "Note: Door Control is not running here; deploying anyway to bring it back."; fi
 umask 077
 BKROOT=/srv/fair-apps/door-control-backups
 mkdir -p -m 700 "$BKROOT"
@@ -161,7 +163,10 @@ restore_prev() {
   echo "Deploy FAILED: starting the previous version ($PREV) again."
   git checkout -q "$PREV" || true
   docker compose up -d || true
+  R=starting
+  for i in $(seq 1 18); do sleep 5; R=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q app)" 2>/dev/null || true); if [ "$R" = healthy ]; then break; fi; done
   docker compose ps || true
+  if [ "$R" = healthy ]; then echo "The previous version is running and healthy."; else echo "The previous version is $R, not healthy: tell Jake. Use the UniFi Access app for urgent door changes."; fi
   echo "Backup in $BK"
 }
 trap restore_prev ERR
@@ -170,6 +175,7 @@ S=starting
 for i in $(seq 1 18); do sleep 5; S=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q app)"); if [ "$S" = healthy ]; then break; fi; done
 if [ "$S" != healthy ]; then docker compose logs --tail=40; echo "Stop: the new version is $S, not healthy."; restore_prev; exit 1; fi
 trap - ERR
+for P in deploy pre-rollback; do ls -1d "$BKROOT/$P"-* 2>/dev/null | sort | head -n -10 | xargs -r rm -rf --; done
 docker compose ps
 echo "Deployed $(cat VERSION). Backup in $BK")
 ```
@@ -177,7 +183,8 @@ After it: send the Telegram bot `/doors`; the next door change sends an alert to
 chats. Check `docker compose exec app python manage.py backup` prints a path.
 
 ### Rollback to the previous Docker version (1.1.0 and later)
-Goes back to the commit and data of one `deploy-<time>` folder made by the deploy block. Every check
+Goes back to the commit and data of one `deploy-<time>` folder made by the deploy block (the typed
+name must look like `deploy-20261201-093000`; anything else, such as `../`, stops it). Every check
 runs before the container is stopped: the folder has the database, config.json and previous-commit; it
 was not restored before (a `restored` marker makes a second run stop, so newer data is never
 overwritten twice); the old systemd service is not running; and the running app has no activity or
@@ -191,6 +198,7 @@ cd /srv/fair-apps/door-control
 BKROOT=/srv/fair-apps/door-control-backups
 ls -d "$BKROOT"/deploy-* 2>/dev/null || { echo "Stop: there are no deploy backups. Nothing changed."; exit 1; }
 read -rp "Deploy backup to go back to (for example deploy-20261201-093000): " NAME
+[[ "$NAME" =~ ^deploy-[0-9-]+$ ]] || { echo "Stop: type a folder name like deploy-20261201-093000. Nothing changed."; exit 1; }
 BK=$BKROOT/$NAME
 for f in doorcontrol.db config.json previous-commit; do test -f "$BK/$f" || { echo "Stop: $BK/$f is missing. Nothing changed."; exit 1; }; done
 if [ -e "$BK/restored" ]; then echo "Stop: $NAME was already restored ($(cat "$BK/restored")); again would overwrite newer data. Nothing changed."; exit 1; fi
@@ -231,6 +239,7 @@ for i in $(seq 1 18); do sleep 5; S=$(docker inspect -f '{{.State.Health.Status}
 if [ "$S" != healthy ]; then docker compose logs --tail=40; echo "Stop: the previous version is $S, not healthy."; restore_new; exit 1; fi
 trap - ERR
 date > "$BK/restored"
+for P in deploy pre-rollback; do ls -1d "$BKROOT/$P"-* 2>/dev/null | sort | head -n -10 | xargs -r rm -rf --; done
 docker compose ps
 echo "Back on $(cat VERSION) with the data of $NAME. The data from before is in $PRE")
 ```
@@ -363,7 +372,8 @@ dev-standards PR after 1.1.0 deploys.
   part opens nothing and is alerted. "ALL" / "*" never open anything from the calendar.
 - Calendar events open doors only when CONFIRMED, from an allowed organizer, not an unanswered
   invitation, within `max_window_hours`; feed unknown/stale = no new calendar window, open ones end at
-  their recorded `ends_at`.
+  their recorded calendar end (`cal_ends_at`), never earlier, even when an overlapping schedule ends
+  first. Back-to-back calendar windows never hold a door over `max_window_hours` (<= 24) without a break.
 - Deploy blocks build before they stop the running service.
 
 ## History
@@ -382,6 +392,16 @@ dev-standards PR after 1.1.0 deploys.
   age, Docker log rotation, TZ, new deploy and rollback blocks. Additive schema: `door_state.source/
   ends_at/hand_alerted`, `log.kind`, `kv`. No new `.env` lines. Server sessions and the in-app people
   list (AC40/41/41a) come in PR 2 (1.2.0).
+  Review round 1 fixes (2026-11-28): a calendar hold is kept in `door_state.cal_ends_at` (additive) and
+  never shortened while the calendar is stale or not read yet, also when a schedule overlaps (R1); an
+  empty/unclear lock rule is never a hand change, it is retried and alerted (Q1), read failures log one
+  row per outage (Q2); back-to-back calendar windows may not hold a door over 24 h, `max_window_hours`
+  capped at 24 (S11), all-day buffers not counted (R3); alert for every calendar window that opens a
+  door, with title and UID (S12); no `allowed_organizers` in config.example.json (R2); links stripped
+  from titles in alerts (S15); strangers checked before the Telegram limit (S16); startup alert for
+  `DOORCONTROL_DEV_ALLOW_HTTP` (S17); BOM accepted (Q3); deploy runs when the app is down and
+  `restore_prev` waits for healthy (R5), newest 10 deploy/rollback folders kept (S13), rollback name
+  checked (S14); docs for R4/Q5 and Q4.
 
 ## Team workflow
 - Standards: .claude/standards/ (synced from the dev-standards repo; don't edit here)

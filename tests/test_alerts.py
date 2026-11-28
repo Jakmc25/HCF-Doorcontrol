@@ -493,6 +493,29 @@ class BotTests(unittest.TestCase):
         self.clock.advance(61)
         self.assertIn("Event Center", say(5)[1])
 
+    def test_stranger_checked_before_rate_limit(self):
+        """Review S16: a chat that is not allowed never enters the command limit and
+        gets at most one "Not authorized" a minute."""
+        b = self.bot(FakeTelegram([]), max_commands_per_minute=2)
+        say = lambda i: b.process_update(
+            update(i, "/unlock office", chat=99, now=self.clock())
+        )
+        with self.assertLogs("doorcontrol", "INFO"):
+            first = say(1)
+            rest = [say(i) for i in range(2, 30)]
+        self.assertEqual(first[0], 99)
+        self.assertIn("Not authorized", first[1])
+        self.assertEqual(rest, [None] * 28)
+        self.assertNotIn(99, b._recent)
+        self.assertEqual(put_types(self.mock), [])
+        self.clock.advance(61)
+        with self.assertLogs("doorcontrol", "INFO"):
+            self.assertIn("Not authorized", say(40)[1])
+        # The allowed chat still has its full limit.
+        self.assertIn(
+            "Office", b.process_update(update(50, "/doors", now=self.clock()))[1]
+        )
+
     def test_door_action_logged_as_telegram_chat_name(self):
         b = self.bot(FakeTelegram([]))
         b.process_update(update(1, "/lock office", now=self.clock(), name="jake"))

@@ -92,6 +92,7 @@ class Bot:
         self.clock = clock
         self._recent = {}
         self._warned = {}
+        self._strangers = {}
         self._stop = threading.Event()
 
     # ---- command handling (pure, testable) ----
@@ -209,6 +210,16 @@ class Bot:
                 cmd,
             )
             return None
+        if chat_id not in self.allowed:
+            # Review S16: strangers are answered before (and never counted in) the
+            # per-chat command limit; at most one "Not authorized" a minute per chat.
+            log.info("telegram: message from chat %s, which is not allowed", chat_id)
+            if len(self._strangers) > 1000:
+                self._strangers.clear()
+            if now - self._strangers.get(chat_id, -1e18) < 60:
+                return None
+            self._strangers[chat_id] = now
+            return chat_id, self.handle(chat_id, text)
         limited = self._rate_limited(chat_id, now)
         if limited is not None:
             log.info("telegram: chat %s is over the command limit (%s)", chat_id, cmd)

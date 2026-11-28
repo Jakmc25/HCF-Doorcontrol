@@ -96,7 +96,8 @@ gets a message for:
 
 Alerts never slow down or block door control: they wait in a small queue and a separate thread sends
 them. The same alert is sent once, then at most every 30 minutes with "repeated N times since ...";
-at most 20 alerts a minute (the rest arrive as one summary). Alerts never contain tokens or the
+at most 20 alerts a minute (the rest arrive as one summary). The limit counts alerts, not messages:
+with 2 allowed chats that is up to 40 Telegram messages a minute (Jake's choice). Alerts never contain tokens or the
 calendar address. If the bot token or the chat list is empty, alerts are only written to the server
 log. Switch a kind off in `config.json` under `alerts.kinds` (`door_error`, `scheduler`, `calendar`,
 `backup`, `schedule_change`, `status`, `hand_change`, `recovered`; `people` is used from 1.2.0); the other `alerts` settings are
@@ -359,7 +360,8 @@ staff add dates to, with **invitations off** (Google Calendar > Settings > Event
 invitations to my calendar": only when I respond). In its settings > Integrate calendar, copy the
 **Secret address in iCal format** into `calendar.ical_url` in `/data/config.json`, and the
 calendar's own address ("Calendar ID", ends in `@group.calendar.google.com`) into both
-`calendar.allowed_organizers` (a list) and `calendar.calendar_email`. Then create events titled like:
+`calendar.allowed_organizers` (a list, add the key yourself: `config.example.json` leaves it out on
+purpose) and `calendar.calendar_email`. Then create events titled like:
 
 - `Unlock: Event Center` - unlocks that door for the event's time
 - `Unlock: Event Center, Main Gate` - several doors (split on commas, `&` and `and`)
@@ -367,8 +369,14 @@ calendar's own address ("Calendar ID", ends in `@group.calendar.google.com`) int
 Rules (each refused event is written to the server log and sent as a Telegram alert):
 - Only events with status **confirmed** count; tentative and cancelled events never open a door.
 - The organizer must be in `calendar.allowed_organizers`. If that key is missing, the emails in
-  `GOOGLE_ALLOWED_EMAILS` count. If both are empty, no event opens a door (one alert at startup).
+  `GOOGLE_ALLOWED_EMAILS` count. **An empty list (`"allowed_organizers": []`) still counts as set**: it
+  means nobody, and the `GOOGLE_ALLOWED_EMAILS` fallback is not used. Leave the key out to use the admins.
+  If both are empty, no event opens a door (one alert at startup).
   Google lists a secondary calendar itself as the organizer, so activity shows `calendar:<that address>`.
+- The organizer check only proves what the feed says. Google writes the organizer, but **the real
+  control is who can add or edit events on that calendar**: anyone with "Make changes to events" on it
+  can unlock doors. Keep that list to the people who should open doors. Every calendar event that opens
+  a door is sent as a Telegram alert with its title and UID, so an unexpected one is seen at once.
 - An invitation nobody accepted (`NEEDS-ACTION` or `TENTATIVE`; no answer counts as not accepted) never
   opens a door, even from an allowed organizer. With `calendar_email` set, only that attendee counts;
   without it, every attendee other than the organizer.
@@ -376,21 +384,30 @@ Rules (each refused event is written to the server log and sent as a Telegram al
   is a door). Otherwise each part must be a door's exact name, or match part of exactly one door's name.
   A part that matches no door or several doors opens nothing; the other parts still apply. `ALL` and
   `*` never open anything: list the doors.
-- An event may be at most `max_window_hours` (24) long, counting `buffer_before_min` /
-  `buffer_after_min`. An **all-day event** unlocks from midnight to midnight local time and counts as
-  24 hours even on a daylight-saving day; an all-day event spanning several days is refused (make one
-  event per day). Door Control looks back `max_window_hours / 24 + 1` days (rounded up) for events
+- An event may be at most `max_window_hours` (24, and never more than 24 whatever `config.json` says)
+  long, counting `buffer_before_min` / `buffer_after_min`. An **all-day event** unlocks from
+  midnight to midnight local time and counts as 24 hours even on a daylight-saving day, buffers not counted; an
+  all-day event spanning several days is refused (make one event per day).
+- Events back to back (or overlapping) on the same door may not keep it unlocked without a break for
+  more than `max_window_hours` plus the buffers. Every event in such a run that would end past that
+  opens nothing on that door (alerted) until the calendar itself has a break. So a daily all-day
+  repeating event unlocks the door only on its first day: use a schedule for doors that should stay
+  open for days. Door Control looks back `max_window_hours / 24 + 1` days (rounded up) for events
   that are still running, so any allowed window is seen.
 - Repeating events: daily, weekly (on chosen weekdays), monthly (on day numbers, or "2nd Tuesday" /
   "last Friday"), yearly, with an end date or count. Anything else (for example "5th Monday",
-  hourly) is skipped and alerted, never guessed.
+  hourly) is skipped and alerted, never guessed. Door Control tries at most 5,000 dates per repeating
+  event, so a **daily** event that started more than about 13 years ago is skipped and alerted: end it
+  and make a new one.
 - Daylight saving: a start in the hour that does not exist when the clocks spring forward (2:00-2:59
   AM) is skipped that day and alerted; an end in that hour moves to 3:00 AM. In the repeated hour in
   November an event runs once (at the first 1:xx). Schedules follow the same rule.
 - Feed problems: an empty, web-page or cut-off reply keeps the last calendar that was read, so no door
-  closes early. Until the first good read after a start, and when the feed has not been read for
+  closes early (a feed starting with a byte order mark is read normally). Until the first good read after a start, and when the feed has not been read for
   `stale_minutes` (60, the dashboard says "Calendar stale"), no calendar unlock starts; a door already
-  open for an event closes at that event's end as it was known.
+  open for an event closes at that event's end as it was known, also when a schedule holds the same
+  door and ends sooner (the calendar's end is kept separately and never shortened while the calendar
+  cannot be trusted).
 
 Use `buffer_before_min` / `buffer_after_min` to unlock early or stay open after (e.g. rental
 setup/cleanup). Anyone who can edit that calendar can unlock doors, so share it carefully.
@@ -404,7 +421,8 @@ the dashboard sign-in. The same chats get the alerts (see "Telegram alerts").
 Safety: commands only work in private chats with the bot (groups and buttons are ignored); a message
 older than 2 minutes (`max_age_seconds`), for example one sent while the app was down, is dropped
 without action; a chat may send 10 commands a minute (`max_commands_per_minute`), the rest get one
-"Slow down" reply. Door actions show in Recent activity as `telegram:<chat id>/<name>`.
+"Slow down" reply. A chat that is not allowed gets at most one "Not authorized" reply a minute and is
+never counted in that limit. Door actions show in Recent activity as `telegram:<chat id>/<name>`.
 
 ### Moving from the old systemd install (one time)
 The full move, rollback and later-deploy blocks are in `CLAUDE.md` under "Where it runs". Order:
@@ -420,7 +438,10 @@ prompt** halfway. Run `sudo -v` right before pasting it, so sudo is already unlo
 - If someone changes a door by hand during a schedule or calendar window (found within 5 minutes, or at
   the end), the scheduler reports it once and leaves the door alone.
 - If UniFi is unreachable the scheduler keeps retrying every 30 seconds and catches up on restart; the
-  activity log gets one row per door and action per outage, and one when it works again.
+  activity log gets one row per door and action per outage, and one when it works again. That includes
+  reading the door at the end of a window. An empty or unclear answer from UniFi about a door is never
+  taken as a change by hand: the door is left as it is, the read is retried every tick and alerted as
+  "could not read the door".
 - When two windows overlap on a door, what happens at the end ("back to normal" or "lock") is chosen
   when the last one ends, from the windows active just before.
 
