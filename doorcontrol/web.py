@@ -1,141 +1,681 @@
-"""Web dashboard + JSON API (stdlib http.server, password via HTTP Basic auth)."""
-import base64
+"""Web dashboard + JSON API (stdlib http.server).
+
+Sign-in is the only gate: Google (verified hardincountyfair.org accounts) at the public
+hostname, or the break-glass admin password made with manage.py. Every route except the
+sign-in page, its static files, the sign-in routes and the loopback /health needs a session,
+on the fair network too. Changes also need the CSRF token from /api/bootstrap.
+The scheduler and the Telegram bot never depend on anything in this module.
+"""
+
+import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
+import threading
+import time
+import urllib.parse
 from datetime import datetime
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
+from . import auth, google_signin
 from .engine import DoorError, validate_schedule
 from .unifi import UnifiError
 
 log = logging.getLogger("doorcontrol")
-STATIC = os.path.join(os.path.dirname(__file__), "static")
+STATIC = Path(__file__).resolve().parent / "static"
+_VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
+VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.is_file() else "dev"
+
+# Session lifetime for Google and admin sign-ins, in one place (copied modules read DAYS).
+SESSION_DAYS = 14
+AUTH_COOKIE = "doors_auth"
+CSRF_COOKIE = "doors_session"
+CSRF_MAX_AGE = 86400
+# The only static files served without a session: what the sign-in and error pages need.
+LOGIN_STATIC = {"login.js", "style.css", "fair-logo.png"}
+CT = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+}
+HTML = "text/html; charset=utf-8"
+# Sent on every response (as Awards): no inline script or style, never framed.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; "
+    "form-action 'self'",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Robots-Tag": "noindex, nofollow",
+    "Cache-Control": "no-store",
+}
+SERVER_ERROR = "The request could not be completed. Nothing was changed."
+# Only these TCP peers may vouch for a request through CF-Connecting-IP and the public Host.
+# Default: the gateway of the app's own compose network (door-control-net, 172.31.248.0/29),
+# which is where cloudflared on fair-server appears when it connects to 127.0.0.1:8480.
+# Other containers (other fair apps) are on other networks and are not trusted. Loopback is
+# left out: inside the container only Docker's health check uses it, and /health needs no
+# trust. Wrong value = public sign-in refused, never open. X-Forwarded-* headers are ignored.
+DEFAULT_TRUSTED_PROXIES = "172.31.248.1/32"
+MAX_CONNECTIONS = 64
+
+# Every route that needs a session: (method, path pattern, handler). Routing goes only
+# through this table, so a new route cannot skip the sign-in check.
+ROUTES = [
+    ("GET", r"/api/bootstrap", "bootstrap"),
+    ("POST", r"/api/logout", "logout"),
+    ("GET", r"/api/doors", "doors"),
+    ("POST", r"/api/doors/([^/]+)/action", "door_action"),
+    ("GET", r"/api/schedules", "schedules"),
+    ("POST", r"/api/schedules", "add_schedule"),
+    ("PUT", r"/api/schedules/(\d+)", "edit_schedule"),
+    ("DELETE", r"/api/schedules/(\d+)", "delete_schedule"),
+    ("GET", r"/api/upcoming", "upcoming"),
+    ("GET", r"/api/log", "activity"),
+    ("GET", r"/api/health", "health"),
+]
+# Open without a session (they are how you get one).
+SIGNIN_ROUTES = [
+    ("GET", "/api/login-info"),
+    ("POST", "/api/login"),
+    ("GET", "/api/auth/google/start"),
+    ("GET", google_signin.CALLBACK),
+]
 
 
-def make_server(cfg, engine):
-    password = cfg.get("password", "")
+class SignInRequired(Exception):
+    pass
 
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "DoorControl"
 
-        def log_message(self, fmt, *args):
-            log.debug("web: " + fmt, *args)
+class TooManyTries(Exception):
+    pass
 
-        # ---- helpers ----
-        def _send(self, code, obj=None, ctype="application/json", raw=None):
-            body = raw if raw is not None else json.dumps(obj).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+
+def is_loopback(address):
+    return address in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
+def host_list(var):
+    """Comma-separated host[:port] list from the environment. Empty means none."""
+    return [h.strip().lower() for h in os.environ.get(var, "").split(",") if h.strip()]
+
+
+def load_secret(data_dir):
+    """Signs sessions and CSRF tokens. Deleting the file (and restarting) signs everyone out."""
+    p = Path(data_dir) / "session-secret"
+    if not p.exists():
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(secrets.token_bytes(32))
+    return p.read_bytes()
+
+
+def proxy_list(value):
+    """'127.0.0.1, 172.16.0.0/12' -> networks. A bad entry stops the app (fail closed)."""
+    nets = []
+    for item in str(value or "").split(","):
+        if item.strip():
+            try:
+                nets.append(ipaddress.ip_network(item.strip(), strict=False))
+            except ValueError:
+                raise SystemExit(
+                    "TRUSTED_PROXIES: %r is not an IP address or range." % item
+                )
+    return nets
+
+
+def peer_in(address, networks):
+    try:
+        a = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    return any(a.version == n.version and a in n for n in networks)
+
+
+class FailureLimiter:
+    """Break-glass failures: at most `per_address` per address and `overall` in total per
+    window (15 minutes). Old entries are pruned on every call, so memory stays bounded.
+    """
+
+    def __init__(self, per_address=10, overall=50, window=900):
+        self.per_address, self.overall, self.window = per_address, overall, window
+        self.by_address = {}
+        self.lock = threading.Lock()
+
+    def _prune(self, now):
+        for ip in list(self.by_address):
+            kept = [t for t in self.by_address[ip] if now - t < self.window]
+            if kept:
+                self.by_address[ip] = kept
+            else:
+                del self.by_address[ip]
+
+    def total(self):
+        return sum(len(v) for v in self.by_address.values())
+
+    def allowed(self, ip):
+        with self.lock:
+            self._prune(time.time())
+            return (
+                len(self.by_address.get(ip, ())) < self.per_address
+                and self.total() < self.overall
+            )
+
+    def failed(self, ip):
+        with self.lock:
+            now = time.time()
+            self._prune(now)
+            if self.total() < self.overall:
+                self.by_address.setdefault(ip, []).append(now)
+
+
+class Server(ThreadingHTTPServer):
+    """At most `max_connections` requests at once; extra connections are closed at once."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, max_connections=MAX_CONNECTIONS):
+        super().__init__(address, handler)
+        self.max_connections = max_connections
+        self._slots = threading.BoundedSemaphore(max_connections)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def make_server(
+    engine, data_dir, bind="0.0.0.0", port=8480, max_connections=MAX_CONNECTIONS
+):
+    os.makedirs(data_dir, exist_ok=True)
+    google_signin.DAYS = auth.DAYS = SESSION_DAYS
+    secret = load_secret(data_dir)
+    httpd = Server((bind, int(port)), Handler, max_connections)
+    httpd.trusted_proxies = proxy_list(
+        os.environ.get("TRUSTED_PROXIES", DEFAULT_TRUSTED_PROXIES)
+    )
+    httpd.limiter = FailureLimiter()
+    httpd.engine = engine
+    httpd.secret = secret
+    httpd.auth = auth.Auth(data_dir, secret, AUTH_COOKIE)
+    httpd.google = google_signin.Google(secret, AUTH_COOKIE)
+    httpd.public_hosts = host_list("PUBLIC_HOSTS")
+    httpd.allowed_hosts = host_list("ALLOWED_HOSTS")
+    if not httpd.google.ready():
+        log.warning("Google sign-in is not set up (GOOGLE_* settings in .env).")
+    if not httpd.public_hosts:
+        log.warning("PUBLIC_HOSTS is empty: nobody can sign in.")
+    return httpd
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "DoorControl"
+    timeout = 30  # seconds a connection may sit idle or half-sent
+
+    def log_message(self, fmt, *args):
+        log.debug("web: " + fmt, *args)
+
+    # ---- plumbing ----
+    @property
+    def engine(self):
+        return self.server.engine
+
+    def end_headers(self):
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
+        super().end_headers()
+
+    def send(self, code, data=None, ctype="application/json", extra=None):
+        if ctype == "application/json":
+            body = json.dumps(data).encode()
+        else:
+            body = data.encode() if isinstance(data, str) else (data or b"")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def static(self, name):
+        root = STATIC
+        f = (root / name).resolve()
+        if f.parent != root or not f.is_file():
+            raise LookupError("Not found.")
+        return self.send(
+            200, f.read_bytes(), CT.get(f.suffix, "application/octet-stream")
+        )
+
+    def jar(self, name):
+        jar = SimpleCookie()
+        try:
+            jar.load(self.headers.get("Cookie", ""))
+            return jar[name].value
+        except Exception:
+            return ""
+
+    def sign(self, v):
+        return hmac.new(self.server.secret, v.encode(), hashlib.sha256).hexdigest()
+
+    def from_proxy(self):
+        return peer_in(self.client_address[0], self.server.trusted_proxies)
+
+    def ip(self):
+        """The person's address: CF-Connecting-IP only when a trusted proxy sent it."""
+        if self.from_proxy():
+            return self.headers.get("CF-Connecting-IP") or self.client_address[0]
+        return self.client_address[0]
+
+    def body(self, limit=65536):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("Invalid request length.")
+        if n < 0:
+            raise ValueError("Invalid request length.")
+        if n > limit:
+            raise ValueError("Request too large.")
+        b = json.loads(self.rfile.read(n) or b"{}")
+        if not isinstance(b, dict):
+            raise ValueError("Invalid request.")
+        return b
+
+    # ---- CSRF ----
+    def csrf_cookie(self):
+        """The signed CSRF cookie value if valid, else ''. Format: stamp.nonce.mac"""
+        try:
+            v = self.jar(CSRF_COOKIE)
+            stamp, nonce, mac = v.split(".")
+            if abs(time.time() - int(stamp)) < CSRF_MAX_AGE and hmac.compare_digest(
+                self.sign(stamp + "." + nonce), mac
+            ):
+                return v
+        except Exception:
+            pass
+        return ""
+
+    def same_origin(self):
+        origin = self.headers.get("Origin")
+        if origin and urllib.parse.urlsplit(origin).netloc != self.headers.get("Host"):
+            raise PermissionError("Request origin does not match this application.")
+
+    def check_csrf(self):
+        cookie = self.csrf_cookie()
+        if not cookie or not hmac.compare_digest(
+            self.headers.get("X-CSRF-Token", ""), self.sign(cookie)
+        ):
+            raise PermissionError("Reload the page and try again.")
+        self.same_origin()
+
+    # ---- entry points ----
+    def do_GET(self):
+        self.dispatch("GET")
+
+    def do_POST(self):
+        self.dispatch("POST")
+
+    def do_PUT(self):
+        self.dispatch("PUT")
+
+    def do_DELETE(self):
+        self.dispatch("DELETE")
+
+    def not_allowed(self, head=False):
+        body = json.dumps({"error": "This kind of request is not supported."}).encode()
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Allow", "GET, POST, PUT, DELETE")
+        self.end_headers()
+        if not head:
             self.wfile.write(body)
 
-        def _authed(self):
-            h = self.headers.get("Authorization", "")
-            if h.startswith("Basic "):
-                try:
-                    given = base64.b64decode(h[6:]).decode().partition(":")[2]
-                    if hmac.compare_digest(given.encode(), password.encode()):
-                        return True
-                except Exception:
-                    pass
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="Door Control"')
-            self.send_header("Content-Length", "0")
+    def do_HEAD(self):
+        self.not_allowed(head=True)
+
+    def do_PATCH(self):
+        self.not_allowed()
+
+    def do_OPTIONS(self):
+        self.not_allowed()
+
+    def send_error(self, code, message=None, explain=None):
+        """Malformed or unsupported requests: a plain JSON sentence, with the security headers."""
+        self.close_connection = True
+        text = {
+            400: "The request could not be read.",
+            408: "The request took too long.",
+            414: "The address is too long.",
+            431: "The request headers are too large.",
+            501: "This kind of request is not supported.",
+        }.get(code, "The request could not be handled.")
+        body = json.dumps({"error": text}).encode()
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
             self.end_headers()
-            return False
+            if self.command != "HEAD" and code >= 200 and code not in (204, 304):
+                self.wfile.write(body)
+        except OSError:
+            pass
 
-        def _body(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 65536:
-                raise ValueError("Request too large")
-            return json.loads(self.rfile.read(n) or b"{}")
+    def dispatch(self, method):
+        self.user = None
+        try:
+            self.route(method)
+        except SignInRequired:
+            self.send(401, {"error": "Sign in to continue.", "signin": True})
+        except TooManyTries:
+            self.send(429, {"error": "Too many tries. Wait 15 minutes and try again."})
+        except DoorError as e:
+            self.send(404, {"error": str(e)})
+        except UnifiError as e:
+            self.send(502, {"error": str(e)})
+        except ValueError as e:  # includes bad JSON
+            self.send(400, {"error": str(e) or "Invalid request."})
+        except PermissionError as e:
+            self.send(403, {"error": str(e)})
+        except LookupError as e:
+            self.send(404, {"error": str(e) or "Not found."})
+        except Exception:
+            log.exception("web error on %s %s", method, self.path.split("?")[0])
+            self.send(500, {"error": SERVER_ERROR})
 
-        def _route(self, method):
-            if not self._authed():
-                return
-            path = self.path.split("?")[0]
-            try:
-                if method == "GET" and path in ("/", "/index.html"):
-                    with open(os.path.join(STATIC, "index.html"), "rb") as f:
-                        return self._send(200, ctype="text/html; charset=utf-8", raw=f.read())
-                if method == "GET" and path == "/api/doors":
-                    return self._send(200, engine.status())
-                m = re.fullmatch(r"/api/doors/([^/]+)/action", path)
-                if method == "POST" and m:
-                    b = self._body()
-                    door = engine.find_door(m.group(1))
-                    desc = engine.door_action(door, b.get("action"), b.get("minutes"), source="web")
-                    return self._send(200, {"ok": True, "message": "%s: %s" % (door["name"], desc)})
-                if method == "GET" and path == "/api/schedules":
-                    return self._send(200, engine.db.schedules())
-                if method == "POST" and path == "/api/schedules":
-                    sid = engine.db.add_schedule(validate_schedule(self._body()))
-                    self._tick_soon()
-                    return self._send(201, {"id": sid})
-                m = re.fullmatch(r"/api/schedules/(\d+)", path)
-                if m:
-                    sid = int(m.group(1))
-                    if method == "PUT":
-                        if not engine.db.update_schedule(sid, validate_schedule(self._body())):
-                            return self._send(404, {"error": "No such schedule"})
-                        self._tick_soon()
-                        return self._send(200, {"ok": True})
-                    if method == "DELETE":
-                        if not engine.db.delete_schedule(sid):
-                            return self._send(404, {"error": "No such schedule"})
-                        self._tick_soon()
-                        return self._send(200, {"ok": True})
-                if method == "GET" and path == "/api/upcoming":
-                    return self._send(200, engine.upcoming(7))
-                if method == "GET" and path == "/api/log":
-                    rows = engine.db.recent_log(40)
-                    for r in rows:
-                        r["time"] = datetime.fromtimestamp(r["ts"], engine.tz).strftime("%a %b %d %I:%M:%S %p")
-                    return self._send(200, rows)
-                if method == "GET" and path == "/api/health":
-                    cal = engine.calendar
-                    return self._send(200, {
-                        "scheduler_last_tick": engine.last_tick, "scheduler_error": engine.last_error,
-                        "calendar_enabled": bool(cal and cal.url),
-                        "calendar_last_ok": cal.last_ok if cal else None,
-                        "calendar_error": cal.last_error if cal else None,
-                    })
-                return self._send(404, {"error": "Not found"})
-            except DoorError as e:
-                self._send(404, {"error": str(e)})
-            except ValueError as e:
-                self._send(400, {"error": str(e)})
-            except UnifiError as e:
-                self._send(502, {"error": str(e)})
-            except Exception as e:
-                log.exception("web error")
-                self._send(500, {"error": "Internal error: %s" % e})
+    def route(self, method):
+        host = (self.headers.get("Host") or "").lower()
+        u = urllib.parse.urlsplit(self.path)
+        path = urllib.parse.unquote(u.path)
+        q = urllib.parse.parse_qs(u.query)
+        # Headers that claim Cloudflare count only from a trusted proxy (TRUSTED_PROXIES).
+        proxy = self.from_proxy()
+        cloudflare = proxy and bool(self.headers.get("CF-Connecting-IP"))
 
-        def _tick_soon(self):
-            import threading
-            threading.Thread(target=lambda: self._safe_tick(), daemon=True).start()
+        # Docker's health check comes from inside the container: no Host rules, no sign-in.
+        if path == "/health":
+            if (
+                method == "GET"
+                and is_loopback(self.client_address[0])
+                and not self.headers.get("CF-Connecting-IP")
+            ):
+                return self.send(200, {"ok": True, "version": VERSION})
+            raise LookupError("Not found.")
 
-        def _safe_tick(self):
-            try:
-                engine.tick()
-            except Exception as e:
-                log.warning("tick after change failed: %s", e)
+        public = self.server.public_hosts
+        self.remote = proxy and (host in public or cloudflare)
+        if self.remote:
+            # Anything that came through Cloudflare must use the public hostname.
+            if host not in public:
+                raise LookupError("Not found.")
+        elif host not in self.server.allowed_hosts:
+            # Empty ALLOWED_HOSTS refuses every fair-network address.
+            raise PermissionError("Use the fair server address to open Door Control.")
 
-        def do_GET(self):
-            self._route("GET")
+        # ---- sign-in routes (no session needed) ----
+        if method == "GET" and path == "/api/login-info":
+            return self.login_info()
+        if method == "GET" and path in (
+            "/api/auth/google/start",
+            google_signin.CALLBACK,
+        ):
+            if not self.remote:
+                # Google only returns to the HTTPS public hostname.
+                raise LookupError("Not found.")
+            return self.google(host, path, q)
+        if method == "POST" and path == "/api/login":
+            return self.password_login()
 
-        def do_POST(self):
-            self._route("POST")
+        # ---- the gate ----
+        cookie = self.jar(AUTH_COOKIE)
+        admin = self.server.auth.verify(cookie) if cookie else None
+        # Break-glass sessions are shown and logged as "admin:NAME", never like an email.
+        self.user = (
+            "admin:" + admin
+            if admin
+            else (self.server.google.verify(cookie) if cookie else None)
+        )
+        if not self.user:
+            if method == "GET" and path in ("/", "/index.html"):
+                return self.static("login.html")
+            if (
+                method == "GET"
+                and path.startswith("/static/")
+                and path[len("/static/") :] in LOGIN_STATIC
+            ):
+                return self.static(path[len("/static/") :])
+            raise SignInRequired()
 
-        def do_PUT(self):
-            self._route("PUT")
+        if method == "GET" and path in ("/", "/index.html"):
+            return self.static("index.html")
+        if method == "GET" and path.startswith("/static/"):
+            return self.static(path[len("/static/") :])
+        for m, pattern, name in ROUTES:
+            match = re.fullmatch(pattern, path)
+            if match and m == method:
+                if method != "GET":
+                    self.check_csrf()
+                return getattr(self, "api_" + name)(*match.groups())
+        raise LookupError("Not found.")
 
-        def do_DELETE(self):
-            self._route("DELETE")
+    # ---- sign-in ----
+    def google_url(self):
+        if self.remote:
+            return "/api/auth/google/start"
+        public = self.server.public_hosts
+        # On the fair network the button goes to the public hostname (HTTPS).
+        return f"https://{public[0]}/api/auth/google/start" if public else ""
 
-    return ThreadingHTTPServer((cfg.get("bind", "0.0.0.0"), int(cfg.get("port", 8480))), Handler)
+    def login_info(self):
+        url = self.google_url()
+        return self.send(
+            200,
+            {
+                "app": "Fairgrounds Door Control",
+                "google": self.server.google.ready() and bool(url),
+                "google_url": url,
+                "remote": self.remote,
+                "password": bool(self.server.auth.load()),
+            },
+        )
+
+    def google(self, host, path, q):
+        g = self.server.google
+        if not g.ready():
+            return self.send(
+                404,
+                google_signin.page(
+                    "Google sign-in isn’t set up on this app yet. Ask Jake."
+                ),
+                HTML,
+            )
+        if path.endswith("/start"):
+            url, cookie = g.start(host)
+            return self.send(302, b"", HTML, {"Location": url, "Set-Cookie": cookie})
+        try:
+            email = g.finish(
+                host,
+                {k: v[0] for k, v in q.items()},
+                self.jar(google_signin.STATE_COOKIE),
+            )
+        except PermissionError as e:
+            log.warning("google sign-in refused: %s (%s)", e, self.ip())
+            return self.send(403, google_signin.page(str(e)), HTML)
+        log.info("signed in with Google: %s (%s)", email, self.ip())
+        self.engine.db.log("", "sign-in", "web", True, "signed in", user=email)
+        return self.send(
+            200,
+            google_signin.page(),
+            HTML,
+            {"Set-Cookie": g.cookie_header(g.issue(email))},
+        )
+
+    def password_login(self):
+        """Break-glass admin sign-in. Only at the public hostname (the cookie is Secure)."""
+        self.same_origin()
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            raise ValueError("Use a JSON request.")
+        ip = self.ip()
+        limiter = self.server.limiter
+        if not limiter.allowed(ip):
+            log.warning("admin sign-in refused: too many failures (%s)", ip)
+            raise TooManyTries()
+        if not self.remote:
+            limiter.failed(ip)
+            log.warning("admin sign-in refused: not the public address (%s)", ip)
+            raise PermissionError("Admin sign-in works only at the internet address.")
+        b = self.body(4000)
+        a = self.server.auth
+        name = a.check(b.get("name"), b.get("password")) if a.load() else None
+        if not name:
+            limiter.failed(ip)
+            log.warning("admin sign-in failed (%s)", ip)
+            return self.send(401, {"error": "Wrong name or password."})
+        log.info("admin sign-in: admin:%s (%s)", name, ip)
+        self.engine.db.log(
+            "", "sign-in", "web", True, "signed in (password)", user="admin:" + name
+        )
+        return self.send(
+            200, {"ok": True}, extra={"Set-Cookie": a.cookie_header(a.issue(name))}
+        )
+
+    # ---- API (signed in) ----
+    def api_bootstrap(self):
+        cookie = self.csrf_cookie()
+        # Reuse a fresh token; renew it once it is half way to expiry.
+        if not cookie or time.time() - int(cookie.split(".")[0]) > CSRF_MAX_AGE / 2:
+            v = str(int(time.time())) + "." + secrets.token_hex(20)
+            cookie = v + "." + self.sign(v)
+        return self.send(
+            200,
+            {"csrf": self.sign(cookie), "user": self.user, "version": VERSION},
+            extra={
+                "Set-Cookie": f"{CSRF_COOKIE}={cookie}; HttpOnly; Secure; "
+                f"SameSite=Strict; Path=/; Max-Age={CSRF_MAX_AGE}"
+            },
+        )
+
+    def api_logout(self):
+        # Sessions are stateless: this clears the browser's cookie only.
+        return self.send(
+            200,
+            {"ok": True},
+            extra={"Set-Cookie": self.server.auth.cookie_header("", clear=True)},
+        )
+
+    def api_doors(self):
+        return self.send(200, self.engine.status())
+
+    def api_door_action(self, door_query):
+        b = self.body()
+        door = self.engine.find_door(door_query)
+        desc = self.engine.door_action(
+            door, b.get("action"), b.get("minutes"), source="web", user=self.user
+        )
+        return self.send(200, {"ok": True, "message": "%s: %s" % (door["name"], desc)})
+
+    def api_schedules(self):
+        return self.send(200, self.engine.db.schedules())
+
+    def note(self, action, detail):
+        """Activity log row for a change made on the dashboard."""
+        self.engine.db.log("", action, "web", True, detail, user=self.user)
+
+    def api_add_schedule(self):
+        s = validate_schedule(self.body())
+        sid = self.engine.db.add_schedule(s)
+        self.note("schedule add", 'added schedule "%s"' % s["name"])
+        self.tick_soon()
+        return self.send(201, {"id": sid})
+
+    def api_edit_schedule(self, sid):
+        sid = int(sid)
+        old = self.engine.db.get_schedule(sid)
+        if not old:
+            raise LookupError("No such schedule")
+        new = validate_schedule(self.body())
+        if not self.engine.db.update_schedule(sid, new):
+            raise LookupError("No such schedule")
+        same = all(old.get(k) == v for k, v in new.items() if k != "enabled")
+        if same and old["enabled"] != new["enabled"]:
+            verb = "resume" if new["enabled"] else "pause"
+            self.note("schedule " + verb, '%sd schedule "%s"' % (verb, new["name"]))
+        elif old["name"] != new["name"]:
+            self.note(
+                "schedule edit",
+                'changed schedule "%s" (now "%s")' % (old["name"], new["name"]),
+            )
+        else:
+            self.note("schedule edit", 'changed schedule "%s"' % new["name"])
+        self.tick_soon()
+        return self.send(200, {"ok": True})
+
+    def api_delete_schedule(self, sid):
+        sid = int(sid)
+        old = self.engine.db.get_schedule(sid)
+        if not old or not self.engine.db.delete_schedule(sid):
+            raise LookupError("No such schedule")
+        self.note("schedule delete", 'deleted schedule "%s"' % old["name"])
+        self.tick_soon()
+        return self.send(200, {"ok": True})
+
+    def api_upcoming(self):
+        return self.send(200, self.engine.upcoming(7))
+
+    def api_activity(self):
+        rows = self.engine.db.recent_log(40)
+        for r in rows:
+            r["time"] = datetime.fromtimestamp(r["ts"], self.engine.tz).strftime(
+                "%a %b %d %I:%M:%S %p"
+            )
+        return self.send(200, rows)
+
+    def api_health(self):
+        e = self.engine
+        cal = e.calendar
+        return self.send(
+            200,
+            {
+                "scheduler_last_tick": e.last_tick,
+                "scheduler_error": (
+                    "The scheduler hit an error. See the server log."
+                    if e.last_error
+                    else None
+                ),
+                "calendar_enabled": bool(cal and cal.url),
+                "calendar_last_ok": cal.last_ok if cal else None,
+                "calendar_error": cal.last_error if cal else None,
+            },
+        )
+
+    def tick_soon(self):
+        threading.Thread(target=self._safe_tick, daemon=True).start()
+
+    def _safe_tick(self):
+        try:
+            self.engine.tick()
+        except Exception as e:
+            log.warning("tick after change failed: %s", e)

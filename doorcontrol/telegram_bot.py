@@ -1,4 +1,5 @@
 """Telegram control: long-polling bot using only the standard library."""
+
 import json
 import logging
 import re
@@ -25,7 +26,9 @@ HELP = (
     "/upcoming - what's scheduled in the next 3 days"
 )
 
-_DUR = re.compile(r"^(.*?)(?:\s+((?:\d+\s*(?:h|hr|hrs|hours?|m|mins?|minutes?)\s*)+))?$", re.I | re.S)
+_DUR = re.compile(
+    r"^(.*?)(?:\s+((?:\d+\s*(?:h|hr|hrs|hours?|m|mins?|minutes?)\s*)+))?$", re.I | re.S
+)
 _PART = re.compile(r"(\d+)\s*(h|hr|hrs|hours?|m|mins?|minutes?)", re.I)
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -49,7 +52,14 @@ def fmt_schedule(s, names):
         doors = ", ".join(names.get(i, "?") for i in s["doors"])
     when = s["date"] if s["date"] else ",".join(DAY_NAMES[d] for d in s["days"])
     return "#%d %s: %s %s-%s -> %s%s" % (
-        s["id"], s["name"], when, s["start"], s["end"], doors, "" if s["enabled"] else " (paused)")
+        s["id"],
+        s["name"],
+        when,
+        s["start"],
+        s["end"],
+        doors,
+        "" if s["enabled"] else " (paused)",
+    )
 
 
 class Bot:
@@ -67,7 +77,10 @@ class Bot:
         cmd, _, rest = text.partition(" ")
         cmd = cmd.lower().split("@")[0]
         if cmd in ("/start", "/help", "/chatid") and chat_id not in self.allowed:
-            return "Not authorized. Your chat ID is %s - add it to allowed_chat_ids in config.json." % chat_id
+            return (
+                "Not authorized. Your chat ID is %s - add it to allowed_chat_ids in config.json."
+                % chat_id
+            )
         if chat_id not in self.allowed:
             return "Not authorized. Your chat ID is %s." % chat_id
         if cmd in ("/start", "/help"):
@@ -85,22 +98,43 @@ class Bot:
             lines = []
             for d in e.status():
                 icon = "🔓" if d["relay"] == "unlock" else "🔒"
-                extra = " [%s]" % d["rule"] if d["rule"] and d["rule"] != "schedule" else ""
+                extra = (
+                    " [%s]" % d["rule"] if d["rule"] and d["rule"] != "schedule" else ""
+                )
                 lines.append("%s %s%s" % (icon, d["name"], extra))
             return "\n".join(lines) or "No doors found."
         if cmd == "/schedules":
             names = {d["id"]: d["name"] for d in e.doors()}
             rows = [fmt_schedule(s, names) for s in e.db.schedules()]
-            return "\n".join(rows) or "No schedules yet (create them on the web dashboard)."
+            return (
+                "\n".join(rows)
+                or "No schedules yet (create them on the web dashboard)."
+            )
         if cmd == "/upcoming":
             rows = []
             for w in e.upcoming(3):
-                a, b = datetime.fromisoformat(w["start"]), datetime.fromisoformat(w["end"])
-                rows.append("%s%s - %s: %s (%s)" % ("NOW " if w["active"] else "", a.strftime("%a %b %d %I:%M%p"),
-                                                     b.strftime("%I:%M%p"), w["title"], ", ".join(w["doors"])))
+                a, b = datetime.fromisoformat(w["start"]), datetime.fromisoformat(
+                    w["end"]
+                )
+                rows.append(
+                    "%s%s - %s: %s (%s)"
+                    % (
+                        "NOW " if w["active"] else "",
+                        a.strftime("%a %b %d %I:%M%p"),
+                        b.strftime("%I:%M%p"),
+                        w["title"],
+                        ", ".join(w["doors"]),
+                    )
+                )
             return "\n".join(rows) or "Nothing scheduled in the next 3 days."
-        table = {"/unlock": "unlock_for", "/keepunlocked": "keep_unlock", "/lock": "lock",
-                 "/keeplocked": "keep_lock", "/reset": "reset", "/open": "pulse"}
+        table = {
+            "/unlock": "unlock_for",
+            "/keepunlocked": "keep_unlock",
+            "/lock": "lock",
+            "/keeplocked": "keep_lock",
+            "/reset": "reset",
+            "/open": "pulse",
+        }
         if cmd not in table:
             return "Unknown command. Send /help."
         if not rest:
@@ -116,7 +150,9 @@ class Bot:
     def _api(self, method, params, timeout=40):
         url = "https://api.telegram.org/bot%s/%s" % (self.token, method)
         data = urllib.parse.urlencode(params).encode()
-        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, data=data), timeout=timeout
+        ) as r:
             return json.loads(r.read())
 
     def start(self):
@@ -134,7 +170,9 @@ class Bot:
                     msg = u.get("message") or {}
                     if msg.get("text") and msg.get("chat", {}).get("type") == "private":
                         reply = self.handle(msg["chat"]["id"], msg["text"])
-                        self._api("sendMessage", {"chat_id": msg["chat"]["id"], "text": reply})
+                        self._api(
+                            "sendMessage", {"chat_id": msg["chat"]["id"], "text": reply}
+                        )
             except Exception as ex:
                 log.warning("telegram: %s", ex)
                 self._stop.wait(10)

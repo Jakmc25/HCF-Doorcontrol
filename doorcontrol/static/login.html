@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Sign in · Fairgrounds Door Control</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="loading">
+      <form id="login" class="card login-card" novalidate>
+        <img src="/static/fair-logo.png" alt="Hardin County Fair" width="150" />
+        <h1>Fairgrounds Door Control</h1>
+        <p class="muted"
+          >Sign in with your hardincountyfair.org Google account.</p
+        >
+        <a
+          id="google"
+          class="button primary big"
+          href="/api/auth/google/start"
+          hidden
+          >Sign in with Google</a
+        >
+        <p id="google-note" class="muted" hidden></p>
+        <details id="admin" class="login-admin" hidden>
+          <summary>Admin sign-in</summary>
+          <div class="login-fields">
+            <label
+              >Name<input
+                name="name"
+                autocomplete="username"
+                autocapitalize="none"
+                required
+            /></label>
+            <label
+              >Password<input
+                name="password"
+                type="password"
+                autocomplete="current-password"
+                required
+            /></label>
+            <button type="submit" class="primary big">Sign in</button>
+          </div>
+        </details>
+        <p id="err" class="error-text" role="alert"></p>
+      </form>
+    </main>
+    <script src="/static/login.js"></script>
+  </body>
+</html>

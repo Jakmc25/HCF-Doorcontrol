@@ -1,7 +1,8 @@
 """Fake UniFi Access controller for testing without touching real doors.
 
-    python3 mock_unifi.py 12445        # then point config.json at http://127.0.0.1:12445
+python3 mock_unifi.py 12445        # then point config.json at http://127.0.0.1:12445
 """
+
 import json
 import re
 import sys
@@ -15,22 +16,42 @@ TOKEN = "test-token"
 class Mock:
     def __init__(self):
         self.doors = {
-            "d1": {"id": "d1", "name": "Event Center", "full_name": "Fairgrounds - Event Center", "door_lock_relay_status": "lock", "door_position_status": "close"},
-            "d2": {"id": "d2", "name": "Office", "full_name": "Fairgrounds - Office", "door_lock_relay_status": "lock", "door_position_status": "close"},
-            "d3": {"id": "d3", "name": "Main Gate", "full_name": "Fairgrounds - Main Gate", "door_lock_relay_status": "lock", "door_position_status": "close"},
+            "d1": {
+                "id": "d1",
+                "name": "Event Center",
+                "full_name": "Fairgrounds - Event Center",
+                "door_lock_relay_status": "lock",
+                "door_position_status": "close",
+            },
+            "d2": {
+                "id": "d2",
+                "name": "Office",
+                "full_name": "Fairgrounds - Office",
+                "door_lock_relay_status": "lock",
+                "door_position_status": "close",
+            },
+            "d3": {
+                "id": "d3",
+                "name": "Main Gate",
+                "full_name": "Fairgrounds - Main Gate",
+                "door_lock_relay_status": "lock",
+                "door_position_status": "close",
+            },
         }
         self.rules = {k: {"type": "schedule", "ended_time": 0} for k in self.doors}
         self.calls = []  # (method, path, body)
         self.fail = False
 
 
-def make_server(mock, port=0):
+def make_server(mock, port=0, ssl_context=None):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
         def _reply(self, code, data=None, code_str="SUCCESS"):
-            body = json.dumps({"code": code_str, "msg": "success", "data": data}).encode()
+            body = json.dumps(
+                {"code": code_str, "msg": "success", "data": data}
+            ).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -53,8 +74,13 @@ def make_server(mock, port=0):
                 if method == "GET":
                     return self._reply(200, mock.rules[did])
                 t = body.get("type")
-                mock.rules[did] = {"type": "schedule" if t == "reset" else t, "ended_time": int(time.time()) + 60 * body.get("interval", 0)}
-                mock.doors[did]["door_lock_relay_status"] = "unlock" if t in ("keep_unlock", "custom") else "lock"
+                mock.rules[did] = {
+                    "type": "schedule" if t == "reset" else t,
+                    "ended_time": int(time.time()) + 60 * body.get("interval", 0),
+                }
+                mock.doors[did]["door_lock_relay_status"] = (
+                    "unlock" if t in ("keep_unlock", "custom") else "lock"
+                )
                 return self._reply(200, "success")
             m = re.fullmatch(r"/api/v1/developer/doors/(\w+)/unlock", self.path)
             if m and method == "PUT" and m.group(1) in mock.doors:
@@ -68,6 +94,8 @@ def make_server(mock, port=0):
             self._handle("PUT")
 
     srv = HTTPServer(("127.0.0.1", port), H)
+    if ssl_context:  # HTTPS like the real console (tests of certificate pinning)
+        srv.socket = ssl_context.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 

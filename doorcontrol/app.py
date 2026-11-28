@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 from .db import DB
 from .engine import Engine
-from .ical import Calendar
+from .ical import Calendar, check_url
 from .telegram_bot import Bot
 from .unifi import UnifiClient
 from .web import make_server
@@ -14,24 +14,55 @@ from .web import make_server
 
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
-    path = argv[0] if argv else os.environ.get("DOORCONTROL_CONFIG", "config.json")
+    # DATA_DIR holds config.json and the database (/data in Docker, data/ locally).
+    data_dir = os.environ.get("DATA_DIR", "data")
+    path = (
+        argv[0]
+        if argv
+        else os.environ.get("DOORCONTROL_CONFIG")
+        or os.path.join(data_dir, "config.json")
+    )
     with open(path) as f:
         cfg = json.load(f)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     log = logging.getLogger("doorcontrol")
 
-    web_cfg = cfg.get("web", {})
-    if not web_cfg.get("password") or web_cfg["password"] == "change-me":
-        sys.exit("Set web.password in config.json (it protects the lock controls).")
+    # Sign-in replaced the dashboard password; DATA_DIR replaced db_path.
+    obsolete = [k for k in ("web", "db_path") if k in cfg]
+    if obsolete:
+        log.warning(
+            "config.json: %s no longer used and ignored (sign-in replaced the "
+            "password; DATA_DIR sets the data folder).",
+            ", ".join(obsolete),
+        )
     u = cfg["unifi"]
     if not u.get("token") or u["token"].startswith("PASTE"):
         sys.exit("Set unifi.token in config.json.")
 
-    db_path = cfg.get("db_path", "data/doorcontrol.db")
-    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
+    db_path = os.path.join(data_dir, "doorcontrol.db")
     tz = ZoneInfo(cfg.get("timezone", "America/New_York"))
-    client = UnifiClient(u["host"], u["token"], u.get("verify_tls", False))
+    try:
+        client = UnifiClient(
+            u["host"],
+            u["token"],
+            u.get("verify_tls", False),
+            cert_sha256=u.get("cert_sha256") or None,
+        )
+    except ValueError as e:
+        sys.exit(str(e))
+    if u["host"].startswith("https") and not client.pinned and not u.get("verify_tls"):
+        log.warning(
+            "unifi.cert_sha256 is not set: the console's certificate is not checked "
+            "(see README, 'Pin the UniFi console certificate')."
+        )
     cal_cfg = cfg.get("calendar", {})
+    try:
+        check_url(cal_cfg.get("ical_url"))
+    except ValueError as e:
+        sys.exit(str(e))
     calendar = Calendar(cal_cfg, tz) if cal_cfg.get("ical_url") else None
     engine = Engine(cfg, DB(db_path), client, calendar)
 
@@ -40,8 +71,10 @@ def main(argv=None):
     engine.start(int(cfg.get("tick_seconds", 30)))
     Bot(cfg.get("telegram", {}), engine).start()
 
-    server = make_server(web_cfg, engine)
-    log.info("Door Control running on http://%s:%s", web_cfg.get("bind", "0.0.0.0"), web_cfg.get("port", 8480))
+    bind = os.environ.get("BIND", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8480"))
+    server = make_server(engine, data_dir, bind, port)
+    log.info("Door Control running on http://%s:%s", bind, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

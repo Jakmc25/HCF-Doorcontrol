@@ -4,6 +4,7 @@ Supports timed and all-day events, TZID/UTC times, EXDATE, modified instances
 (RECURRENCE-ID) and the common RRULE forms (DAILY, WEEKLY+BYDAY, MONTHLY by
 day-of-month, YEARLY, with INTERVAL / COUNT / UNTIL).
 """
+
 import re
 import threading
 import time
@@ -13,6 +14,18 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 log = logging.getLogger("doorcontrol")
+
+MAX_FEED_BYTES = 5 * 1024 * 1024
+
+
+def check_url(url):
+    """Config check for calendar.ical_url: the secret feed must come over HTTPS."""
+    if url and not str(url).startswith("https://"):
+        raise ValueError(
+            "calendar.ical_url must start with https:// "
+            "(use Google Calendar's secret address in iCal format)."
+        )
+
 
 DAYS = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
 
@@ -38,7 +51,13 @@ def _prop(line):
 
 
 def _unescape(s):
-    return s.replace("\\n", "\n").replace("\\N", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+    return (
+        s.replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+    )
 
 
 def _parse_dt(value, params, tz):
@@ -83,7 +102,9 @@ def _parse_events(text, tz):
                 elif name == "STATUS":
                     cur["status"] = value.upper()
                 elif name == "RRULE":
-                    cur["rrule"] = dict(p.split("=", 1) for p in value.split(";") if "=" in p)
+                    cur["rrule"] = dict(
+                        p.split("=", 1) for p in value.split(";") if "=" in p
+                    )
                 elif name == "EXDATE":
                     for v in value.split(","):
                         cur["exdates"].append(_parse_dt(v, params, tz)[0])
@@ -111,7 +132,15 @@ def _rrule_occurrences(start, rule):
     tzinfo = start.tzinfo
 
     def at(d):
-        return datetime(d.year, d.month, d.day, start.hour, start.minute, start.second, tzinfo=tzinfo)
+        return datetime(
+            d.year,
+            d.month,
+            d.day,
+            start.hour,
+            start.minute,
+            start.second,
+            tzinfo=tzinfo,
+        )
 
     emitted = 0
 
@@ -122,7 +151,9 @@ def _rrule_occurrences(start, rule):
                 yield at(start.date() + timedelta(days=k * interval))
                 k += 1
         elif freq == "WEEKLY":
-            byday = sorted(DAYS[c[-2:]] for c in rule.get("BYDAY", "").split(",") if c[-2:] in DAYS) or [start.weekday()]
+            byday = sorted(
+                DAYS[c[-2:]] for c in rule.get("BYDAY", "").split(",") if c[-2:] in DAYS
+            ) or [start.weekday()]
             week0 = start.date() - timedelta(days=start.weekday())
             w = 0
             while True:
@@ -131,7 +162,11 @@ def _rrule_occurrences(start, rule):
                     yield at(base + timedelta(days=wd))
                 w += 1
         elif freq == "MONTHLY":
-            day = int(rule["BYMONTHDAY"].split(",")[0]) if "BYMONTHDAY" in rule else start.day
+            day = (
+                int(rule["BYMONTHDAY"].split(",")[0])
+                if "BYMONTHDAY" in rule
+                else start.day
+            )
             k = 0
             while True:
                 m = start.month - 1 + k * interval
@@ -165,7 +200,11 @@ def _rrule_occurrences(start, rule):
 
 def expand(events, first, last):
     """Return [{'title','start','end'}] overlapping [first, last]."""
-    overridden = {(e.get("uid"), e["recurrence_id"].astimezone(timezone.utc)) for e in events if "recurrence_id" in e}
+    overridden = {
+        (e.get("uid"), e["recurrence_id"].astimezone(timezone.utc))
+        for e in events
+        if "recurrence_id" in e
+    }
     out = []
     for e in events:
         if e.get("status") == "CANCELLED":
@@ -212,8 +251,10 @@ class Calendar:
     def fetch_once(self):
         req = urllib.request.Request(self.url, headers={"User-Agent": "door-control"})
         with urllib.request.urlopen(req, timeout=20) as r:
-            text = r.read().decode("utf-8", "replace")
-        self.load_text(text)
+            raw = r.read(MAX_FEED_BYTES + 1)
+        if len(raw) > MAX_FEED_BYTES:
+            raise ValueError("calendar feed is larger than 5 MB")
+        self.load_text(raw.decode("utf-8", "replace"))
 
     def load_text(self, text):
         self.events = _parse_events(text, self.tz)
@@ -230,7 +271,10 @@ class Calendar:
             try:
                 self.fetch_once()
             except Exception as e:
-                self.last_error = str(e)
+                # Details (which may include the secret URL) stay in the server log.
+                self.last_error = (
+                    "The calendar feed could not be read. See the server log."
+                )
                 log.warning("calendar refresh failed: %s", e)
             self._stop.wait(self.refresh)
 
@@ -240,14 +284,18 @@ class Calendar:
             title = occ["title"].strip()
             if not title.casefold().startswith(self.prefix):
                 continue
-            rest = title[len(self.prefix):]
+            rest = title[len(self.prefix) :]
             names = [n.strip() for n in re.split(r",|&|\band\b", rest) if n.strip()]
             if not names:
                 continue
-            out.append({
-                "title": title,
-                "start": occ["start"] - self.before,
-                "end": occ["end"] + self.after,
-                "door_queries": ["*" if n.casefold() == "all" else n for n in names],
-            })
+            out.append(
+                {
+                    "title": title,
+                    "start": occ["start"] - self.before,
+                    "end": occ["end"] + self.after,
+                    "door_queries": [
+                        "*" if n.casefold() == "all" else n for n in names
+                    ],
+                }
+            )
         return out

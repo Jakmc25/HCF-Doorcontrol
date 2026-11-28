@@ -1,0 +1,48 @@
+name: door-control
+services:
+  app:
+    build: .
+    image: door-control:1.0.0
+    restart: unless-stopped
+    init: true
+    # Published on fair-server's loopback only: cloudflared (on the host) connects to
+    # 127.0.0.1:8480; containers and the fair network cannot reach it. See README
+    # "Publishing on the fair network" before changing this line.
+    ports:
+      - "127.0.0.1:8480:8480"
+    environment:
+      # Values come from .env next to this file (never commit it); see .env.example.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_ALLOWED_DOMAINS: ${GOOGLE_ALLOWED_DOMAINS:-}
+      GOOGLE_ALLOWED_EMAILS: ${GOOGLE_ALLOWED_EMAILS:-}
+      PUBLIC_HOSTS: ${PUBLIC_HOSTS:-}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
+      # Only this network's gateway (where cloudflared on the host appears) may vouch for
+      # Cloudflare headers. See README "Trusted proxies".
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-172.31.248.1/32}
+    # /data holds config.json (UniFi/Telegram tokens, calendar URL), doorcontrol.db,
+    # session-secret and accounts.json. Never run "docker compose down -v".
+    volumes:
+      - door_control_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 256m
+# A fixed, small network so the gateway address above never changes and no other
+# container shares it. If the subnet clashes with another Docker network, see README.
+networks:
+  default:
+    name: door-control-net
+    ipam:
+      config:
+        - subnet: 172.31.248.0/29
+          gateway: 172.31.248.1
+volumes:
+  door_control_data:
+    name: door_control_data
