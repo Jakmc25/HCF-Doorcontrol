@@ -40,3 +40,7 @@ Verified fixed: audit findings S1, S2, S4, S5, S8, S9, S10, and every QA audit r
 
 ## Fix round 1
 Sent to developer: R1, Q1, S11, S12, R2, R3, R4/Q5 (docs), R5, S13, S14, S15, S16, S17, Q2, Q3, Q4 (docs).
+
+## Re-check (after 7d4bc71): PASS
+Code reviewer (opus) verified R1, Q1, S11, S12 and R2 fixed, with no new findings, and accepted the three deviations: (a) the chain cap fails closed and is alerted; (b) the calendar-open alert is low priority, but the action is still logged; (c) unclear reads alert after `failures_before_alert`. No BLOCKER or SHOULD-FIX open.
+Release check: NO-GO only on (1) this missing sign-off and (2) the undocumented calendar organizer setup. Both are fixed in docs: the CLAUDE.md deploy notes cover the calendar organizer, and test_qa.py was added to the test commands. No calendar feed is configured on fair-server today, so behavior there is unchanged.

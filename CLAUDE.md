@@ -29,10 +29,10 @@ Run locally against the fake controller: `python3 mock_unifi.py 12445`, then
 127.0.0.1/localhost; without it the app refuses any console that is not https and pinned/verified.
 Run tests (Docker, as on fair-server):
 ```bash
-docker run --rm -v "$PWD":/app -w /app python:3.13-slim-bookworm sh -c 'apt-get -qq update && apt-get -qq install -y tzdata openssl >/dev/null && python tests/test_all.py && python tests/test_google.py && python tests/test_safety.py && python tests/test_alerts.py'
+docker run --rm -v "$PWD":/app -w /app python:3.13-slim-bookworm sh -c 'apt-get -qq update && apt-get -qq install -y tzdata openssl >/dev/null && python tests/test_all.py && python tests/test_google.py && python tests/test_safety.py && python tests/test_alerts.py && python tests/test_qa.py'
 docker run --rm -v "$PWD":/w -w /w node:22-alpine node tests/test_ui.cjs
 ```
-Without Docker: `python3 tests/test_all.py && python3 tests/test_google.py && python3 tests/test_safety.py && python3 tests/test_alerts.py && node tests/test_ui.cjs`.
+Without Docker: `python3 tests/test_all.py && python3 tests/test_google.py && python3 tests/test_safety.py && python3 tests/test_alerts.py && python3 tests/test_qa.py && node tests/test_ui.cjs`.
 Tests use only `mock_unifi.py`, a fake Telegram (`tests/support.py` `Recorder`) and fake clocks.
 Lint:
 ```bash
@@ -179,6 +179,7 @@ for P in deploy pre-rollback; do ls -1d "$BKROOT/$P"-* 2>/dev/null | sort | head
 docker compose ps
 echo "Deployed $(cat VERSION). Backup in $BK")
 ```
+Calendar (only if one is set up): 1.1.0 opens doors only for events from `calendar.allowed_organizers` (or, if that key is missing, `GOOGLE_ALLOWED_EMAILS`, empty on fair-server today). With neither set, every "Unlock:" event is refused with a Telegram alert, nothing more. Today no calendar feed is configured, so nothing changes; when one is added, set `allowed_organizers` (README "Calendar").
 After it: send the Telegram bot `/doors`; the next door change sends an alert to the allowed private
 chats. Check `docker compose exec app python manage.py backup` prints a path.
 
