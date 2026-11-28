@@ -356,7 +356,7 @@ class WebTests(unittest.TestCase):
             req.add_header(k, v)
         try:
             with urllib.request.urlopen(req) as r:
-                if "doors_session=" in (r.headers.get("Set-Cookie") or ""):
+                if "doors_csrf=" in (r.headers.get("Set-Cookie") or ""):
                     self.cookie += "; " + r.headers["Set-Cookie"].split(";")[0]
                 return r.status, r.read()
         except urllib.error.HTTPError as e:

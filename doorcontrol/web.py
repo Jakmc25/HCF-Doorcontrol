@@ -42,7 +42,7 @@ SESSION_HOURS = 12
 SESSION_COOKIE = "__Host-doors_sid"
 # The 1.0.0/1.1.0 stateless cookie: never read again, cleared when a browser sends it.
 OLD_COOKIE = "doors_auth"
-CSRF_COOKIE = "doors_session"
+CSRF_COOKIE = "__Host-doors_csrf"
 PURGE_SECONDS = 3600
 MAX_PEOPLE = 500
 CSRF_MAX_AGE = 86400
@@ -204,7 +204,8 @@ def host_list(var):
 
 
 def load_secret(data_dir):
-    """Signs sessions and CSRF tokens. Deleting the file (and restarting) signs everyone out."""
+    """Signs the CSRF tokens (sessions themselves are rows in the database). To sign
+    everyone out use `manage.py revoke --all`."""
     p = Path(data_dir) / "session-secret"
     if not p.exists():
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -410,12 +411,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- CSRF ----
     def csrf_cookie(self):
-        """The signed CSRF cookie value if valid, else ''. Format: stamp.nonce.mac"""
+        """The signed CSRF cookie value if valid for this session, else ''.
+        Format: stamp.nonce.mac; the mac also covers the hash of the session id."""
         try:
+            sid = self.jar(SESSION_COOKIE)
+            if not sid:
+                return ""
+            bound = Sessions.digest(sid)
             v = self.jar(CSRF_COOKIE)
             stamp, nonce, mac = v.split(".")
             if abs(time.time() - int(stamp)) < CSRF_MAX_AGE and hmac.compare_digest(
-                self.sign(stamp + "." + nonce), mac
+                self.sign(stamp + "." + nonce + "." + bound), mac
             ):
                 return v
         except Exception:
@@ -675,12 +681,13 @@ class Handler(BaseHTTPRequestHandler):
         except PermissionError as e:
             log.warning("google sign-in refused: %s (%s)", e, self.ip())
             # AC41: refusals (for example a fair account not on the list) are logged.
+            # The reason can hold an outsider's email: server log only, never here.
             self.engine.db.log(
                 "",
                 "sign-in refused",
                 "web",
                 False,
-                str(e)[:300],
+                "Google sign-in refused (details in the server log)",
                 kind="signin",
             )
             return self.send(403, google_signin.page(str(e)), HTML)
@@ -688,6 +695,7 @@ class Handler(BaseHTTPRequestHandler):
         self.engine.db.log(
             "", "sign-in", "web", True, "signed in", user=email, kind="signin"
         )
+        self.server.sessions.delete(self.jar(SESSION_COOKIE))  # no old row left valid
         sid = self.server.sessions.create(email, "google", ip=self.ip())
         return self.send(
             200,
@@ -728,6 +736,7 @@ class Handler(BaseHTTPRequestHandler):
             kind="signin",
         )
         gen = a.load()[name]["gen"]
+        self.server.sessions.delete(self.jar(SESSION_COOKIE))  # no old row left valid
         sid = self.server.sessions.create("admin:" + name, "admin", gen, ip)
         return self.send(
             200, {"ok": True}, extra={"Set-Cookie": self.server.sessions.cookie(sid)}
@@ -739,7 +748,8 @@ class Handler(BaseHTTPRequestHandler):
         # Reuse a fresh token; renew it once it is half way to expiry.
         if not cookie or time.time() - int(cookie.split(".")[0]) > CSRF_MAX_AGE / 2:
             v = str(int(time.time())) + "." + secrets.token_hex(20)
-            cookie = v + "." + self.sign(v)
+            bound = Sessions.digest(self.jar(SESSION_COOKIE))
+            cookie = v + "." + self.sign(v + "." + bound)
         return self.send(
             200,
             {

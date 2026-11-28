@@ -324,7 +324,7 @@ class ScheduleChangeAlerts(unittest.TestCase):
         try:
             with urllib.request.urlopen(req) as r:
                 sc = r.headers.get("Set-Cookie") or ""
-                if "doors_session=" in sc:
+                if "doors_csrf=" in sc:
                     self.cookie += "; " + sc.split(";")[0]
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:

@@ -34,6 +34,10 @@ def clean_email(value):
     email = str(value or "").strip().lower()
     if not email:
         raise ValueError("Type an email address.")
+    if not email.isascii():
+        raise ValueError(
+            "Use only letters, digits and the usual symbols in the address."
+        )
     if len(email) > MAX_EMAIL or not _EMAIL.fullmatch(email):
         raise ValueError("That doesn't look like an email address.")
     return email

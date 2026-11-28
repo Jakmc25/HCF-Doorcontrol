@@ -220,7 +220,10 @@ class Stack:
     def with_csrf(self, cookie):
         r = self.call("GET", "/api/bootstrap", cookie=cookie)
         assert r.status == 200, r.body
-        return cookie + "; " + r.cookie("doors_session").split(";")[0], r.json()["csrf"]
+        return (
+            cookie + "; " + r.cookie("__Host-doors_csrf").split(";")[0],
+            r.json()["csrf"],
+        )
 
     def change(self, method, path, body=None, email=JAKE, host=HOST):
         cookie, token = self.with_csrf(self.session(email))
@@ -670,7 +673,7 @@ class SessionTests(Base):
         self.assertNotIn("domain", a)
         self.assertEqual(a["max-age"], str(12 * 3600))
         r = self.st.call("GET", "/api/bootstrap", cookie=self.st.session())
-        a = attrs(r.cookie("doors_session"))
+        a = attrs(r.cookie("__Host-doors_csrf"))
         self.assertTrue(a["httponly"] and a["secure"])
         self.assertEqual(a["samesite"], "Strict")
 
@@ -702,6 +705,53 @@ class SessionTests(Base):
 
 # ---------------------------------------------------------------- 1.2.0 sessions (AC40)
 class ServerSessionTests(Base):
+    def test_csrf_token_from_another_session_refused(self):
+        st = self.st
+        a_cookie, a_token = st.with_csrf(st.session(JAKE))
+        b = st.session(KOLT)  # another signed-in person's session id
+        stolen = a_cookie.split("; ", 1)[1]  # A's CSRF cookie, but with B's session
+        hdr = {"X-CSRF-Token": a_token, "Origin": "https://" + HOST}
+        r = st.call("POST", "/api/people", HOST, {"email": ANN}, b + "; " + stolen, hdr)
+        self.assertEqual(r.status, 403)
+        r = st.call("POST", "/api/people", HOST, {"email": ANN}, a_cookie, hdr)
+        self.assertEqual(r.status, 201, r.body)  # the right session still works
+
+    def test_csrf_cookie_is_host_prefixed(self):
+        r = self.st.call("GET", "/api/bootstrap", cookie=self.st.session())
+        self.assertTrue(r.cookie("__Host-doors_csrf").startswith("__Host-doors_csrf="))
+        a = attrs(r.cookie("__Host-doors_csrf"))
+        self.assertTrue(a["secure"] and a["httponly"])
+        self.assertNotIn("domain", a)
+
+    def test_new_sign_in_deletes_the_old_session_row(self):
+        st = self.st
+        old = st.session(JAKE)
+        self.assertEqual(len(st.eng.db.sessions_list()), 1)
+        # Google sign-in sent with the old cookie
+        r = st.call("GET", "/api/auth/google/start", cookie=old)
+        state = r.cookie("google_state").split(";")[0].split("=", 1)[1]
+        CLAIMS.clear()
+        CLAIMS.update(
+            {
+                "iss": "https://accounts.google.com",
+                "aud": CLIENT_ID,
+                "exp": time.time() + 300,
+                "nonce": st.web.google.mac("nonce." + state),
+                "email": JAKE,
+                "email_verified": True,
+                "hd": "hardincountyfair.org",
+            }
+        )
+        q = urllib.parse.urlencode({"state": state, "code": "abc"})
+        r = st.call(
+            "GET",
+            google_signin.CALLBACK + "?" + q,
+            cookie=f"google_state={state}; {old}",
+        )
+        self.assertEqual(r.status, 200)
+        self.assertEqual(len(st.eng.db.sessions_list()), 1, "old row is gone")
+        self.assertEqual(st.call("GET", "/api/doors", cookie=old).status, 401)
+
     def test_db_stores_hash_only(self):
         r = self.st.google(JAKE)
         sid = r.cookie(SID).split(";")[0].split("=", 1)[1]
@@ -851,7 +901,9 @@ class WhoSignsInTests(Base):
         self.assertEqual(
             (row["action"], row["ok"], row["kind"]), ("sign-in refused", 0, "signin")
         )
-        self.assertIn(ANN, row["detail"])
+        # R2: the outsider's address stays in the server log, never in the activity log.
+        for r2 in st.log_rows():
+            self.assertNotIn(ANN, "%s %s" % (r2["detail"], r2["user"]))
         # No hd hint and no domain-wide access with an empty domain list.
         start = st.call("GET", "/api/auth/google/start").header("Location")
         self.assertNotIn("hd=", start)
@@ -934,6 +986,9 @@ class PeopleTests(Base):
             ("x,y@hardincountyfair.org", "email"),
             ("x@localhost", "email"),
             ("x" * 250 + "@a.org", "email"),
+            ("ann\u200b@hardincountyfair.org", "address"),
+            ("\u202eann@hardincountyfair.org", "address"),
+            ("\u00e4nn@hardincountyfair.org", "address"),
             (ANN.upper(), "already on the People list"),
             (JAKE, "admin"),
             ("KOLT@hardincountyfair.org", "admin"),
@@ -1261,7 +1316,7 @@ class ActivityTests(Base):
         rows = self.st.log_rows()
         self.assertEqual(len(rows), n + 1)
         self.assertEqual((rows[0]["action"], rows[0]["ok"]), ("sign-in refused", 0))
-        self.assertIn("someone@gmail.com", rows[0]["detail"])
+        self.assertNotIn("someone@gmail.com", rows[0]["detail"])  # R2
 
     def test_migration_is_additive(self):
         path = os.path.join(tempfile.mkdtemp(), "old.db")
