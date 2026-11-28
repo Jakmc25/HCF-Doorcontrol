@@ -305,7 +305,9 @@ class ScheduleChangeAlerts(unittest.TestCase):
         self.addCleanup(self.usrv.shutdown)
         self.addCleanup(self.web.server_close)
         self.addCleanup(self.web.shutdown)
-        self.cookie = "doors_auth=" + self.web.google.issue(JAKE)
+        self.cookie = (
+            web.SESSION_COOKIE + "=" + self.web.sessions.create(JAKE, "google")
+        )
         self.csrf = None
         self.csrf = self.call("GET", "/api/bootstrap")[1]["csrf"]
 

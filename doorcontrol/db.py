@@ -30,11 +30,25 @@ CREATE TABLE IF NOT EXISTS kv(
   key TEXT PRIMARY KEY,
   value TEXT
 );
+CREATE TABLE IF NOT EXISTS sessions(
+  id_hash TEXT PRIMARY KEY,
+  user TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  gen TEXT,
+  created REAL NOT NULL,
+  expires REAL NOT NULL,
+  ip TEXT
+);
+CREATE TABLE IF NOT EXISTS people(
+  email TEXT PRIMARY KEY COLLATE NOCASE,
+  added_by TEXT,
+  added_at REAL
+);
 """
 
-# Log kinds (1.1.0). Rows are kept by age; sign-ins have their own cap so they never push
-# door actions out of the log.
-LOG_KINDS = ("door", "schedule", "signin", "system")
+# Log kinds (1.1.0; "people" 1.2.0). Rows are kept by age; sign-ins have their own cap so
+# they never push door actions out of the log.
+LOG_KINDS = ("door", "schedule", "signin", "people", "system")
 SIGNIN_KEEP = 5000
 
 
@@ -207,6 +221,99 @@ class DB:
                 "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", (key, str(value))
             )
             self.conn.commit()
+
+    # ---- sign-in sessions (1.2.0): only sha256 of the cookie id is stored ----
+    def session_add(self, id_hash, user, kind, gen, created, expires, ip=""):
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO sessions(id_hash,user,kind,gen,created,expires,ip) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (id_hash, user, kind, gen, created, expires, ip),
+            )
+            self.conn.commit()
+
+    def session_get(self, id_hash):
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT * FROM sessions WHERE id_hash=?", (id_hash,)
+            ).fetchone()
+        return dict(r) if r else None
+
+    def session_delete(self, id_hash):
+        with self.lock:
+            self.conn.execute("DELETE FROM sessions WHERE id_hash=?", (id_hash,))
+            self.conn.commit()
+
+    def sessions_list(self):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT user,kind,created,expires,ip FROM sessions ORDER BY created"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def sessions_revoke(self, user=None):
+        """Delete the sessions of one user (email or admin:NAME, any case), or all of
+        them with user=None. Returns how many were deleted."""
+        with self.lock:
+            if user is None:
+                cur = self.conn.execute("DELETE FROM sessions")
+            else:
+                cur = self.conn.execute(
+                    "DELETE FROM sessions WHERE lower(user)=lower(?)", (user,)
+                )
+            self.conn.commit()
+            return cur.rowcount
+
+    def sessions_purge(self, now=None):
+        now = time.time() if now is None else now
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM sessions WHERE expires <= ?", (now,))
+            self.conn.commit()
+            return cur.rowcount
+
+    # ---- in-app people list (1.2.0) ----
+    def people(self):
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT email,added_by,added_at FROM people ORDER BY email"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def people_emails(self):
+        with self.lock:
+            rows = self.conn.execute("SELECT email FROM people").fetchall()
+        return {r[0].lower() for r in rows}
+
+    def person_add(self, email, added_by):
+        """False if the email is already on the list (any case)."""
+        with self.lock:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO people(email,added_by,added_at) VALUES(?,?,?)",
+                (email, added_by, time.time()),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def person_remove(self, email):
+        """Remove a person and end their Google sessions in the same transaction.
+        False if the email was not on the list."""
+        with self.lock:
+            try:
+                cur = self.conn.execute(
+                    "DELETE FROM people WHERE email=? COLLATE NOCASE", (email,)
+                )
+                if cur.rowcount == 0:
+                    self.conn.rollback()
+                    return False
+                self.conn.execute(
+                    "DELETE FROM sessions WHERE kind='google' AND lower(user)=lower(?)",
+                    (email,),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
 
     # ---- activity log ----
     def log(self, door, action, source, ok, detail="", user="", kind="door"):

@@ -1,9 +1,14 @@
 """Web dashboard + JSON API (stdlib http.server).
 
-Sign-in is the only gate: Google (verified hardincountyfair.org accounts) at the public
-hostname, or the break-glass admin password made with manage.py. Every route except the
-sign-in page, its static files, the sign-in routes and the loopback /health needs a session,
-on the fair network too. Changes also need the CSRF token from /api/bootstrap.
+Sign-in is the only gate: Google at the public hostname (the admins in
+GOOGLE_ALLOWED_EMAILS plus the in-app People list), or the break-glass admin password made
+with manage.py. Every route except the sign-in page, its static files, the sign-in routes
+and the loopback /health needs a session, on the fair network too. Changes also need the
+CSRF token from /api/bootstrap.
+
+Sessions (1.2.0) are server-side: the browser holds a random id, the database holds only
+its SHA-256, and every request checks that the person is still allowed. 12 hours; sign
+out, `manage.py revoke`, removal from People or from .env (after a restart) end them.
 The scheduler and the Telegram bot never depend on anything in this module.
 """
 
@@ -23,7 +28,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import auth, google_signin
+from . import auth, google_signin, people
 from .engine import DoorError, validate_schedule
 from .unifi import UnifiError
 
@@ -32,10 +37,14 @@ STATIC = Path(__file__).resolve().parent / "static"
 _VERSION_FILE = Path(__file__).resolve().parent.parent / "VERSION"
 VERSION = _VERSION_FILE.read_text().strip() if _VERSION_FILE.is_file() else "dev"
 
-# Session lifetime for Google and admin sign-ins, in one place (copied modules read DAYS).
-SESSION_DAYS = 14
-AUTH_COOKIE = "doors_auth"
+# Session lifetime for Google and admin sign-ins, in one place (server-side sessions).
+SESSION_HOURS = 12
+SESSION_COOKIE = "__Host-doors_sid"
+# The 1.0.0/1.1.0 stateless cookie: never read again, cleared when a browser sends it.
+OLD_COOKIE = "doors_auth"
 CSRF_COOKIE = "doors_session"
+PURGE_SECONDS = 3600
+MAX_PEOPLE = 500
 CSRF_MAX_AGE = 86400
 # The only static files served without a session: what the sign-in and error pages need.
 LOGIN_STATIC = {"login.js", "style.css", "fair-logo.png"}
@@ -81,6 +90,9 @@ ROUTES = [
     ("GET", r"/api/upcoming", "upcoming"),
     ("GET", r"/api/log", "activity"),
     ("GET", r"/api/health", "health"),
+    ("GET", r"/api/people", "people"),
+    ("POST", r"/api/people", "add_person"),
+    ("POST", r"/api/people/remove", "remove_person"),
 ]
 # Open without a session (they are how you get one).
 SIGNIN_ROUTES = [
@@ -93,6 +105,89 @@ SIGNIN_ROUTES = [
 
 class SignInRequired(Exception):
     pass
+
+
+class DoorGoogle(google_signin.Google):
+    """The shared Google sign-in (pinned, never edited here) with this app's list of who
+    may sign in: the admins in GOOGLE_ALLOWED_EMAILS plus the in-app People list.
+
+    The parent's __init__ assigns `self.emails` from the environment; the setter keeps
+    that as `admins`. Every read of `emails` (the parent's finish(), ready(), start() and
+    allowed()) gets the admins plus the people list from the database at that moment.
+    GOOGLE_ALLOWED_DOMAINS still works as in the parent (empty on fair-server).
+    """
+
+    def __init__(self, secret, cookie, db):
+        self._db = db
+        self.admins = []
+        super().__init__(secret, cookie)
+
+    @property
+    def emails(self):
+        return sorted(set(self.admins) | people.listed(self._db))
+
+    @emails.setter
+    def emails(self, value):
+        self.admins = sorted({str(e).strip().lower() for e in value if str(e).strip()})
+
+    def is_admin(self, email):
+        return str(email or "").lower() in self.admins
+
+
+class Sessions:
+    """Server-side sessions. The cookie holds a random 32-byte id; the database keeps only
+    sha256(id), who, kind (google|admin), the account generation for admin sign-ins,
+    created, expires and the address. Expired rows are purged at most once an hour."""
+
+    def __init__(self, db, hours=SESSION_HOURS, clock=time.time):
+        self.db, self.hours, self.clock = db, hours, clock
+        self._purged = 0.0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def digest(sid):
+        return hashlib.sha256(sid.encode()).hexdigest()
+
+    def create(self, user, kind, gen=None, ip=""):
+        sid = secrets.token_urlsafe(32)
+        now = self.clock()
+        self.db.session_add(
+            self.digest(sid), user, kind, gen, now, now + self.hours * 3600, ip
+        )
+        return sid
+
+    def purge(self):
+        now = self.clock()
+        with self._lock:
+            if now - self._purged < PURGE_SECONDS:
+                return
+            self._purged = now
+        self.db.sessions_purge(now)
+
+    def lookup(self, sid):
+        self.purge()
+        if not sid or len(sid) > 200:
+            return None
+        h = self.digest(sid)
+        row = self.db.session_get(h)
+        if row and row["expires"] <= self.clock():
+            self.db.session_delete(h)
+            return None
+        return row
+
+    def delete(self, sid):
+        if sid:
+            self.db.session_delete(self.digest(sid))
+
+    def cookie(self, sid):
+        return (
+            f"{SESSION_COOKIE}={sid}; HttpOnly; Secure; SameSite=Strict; Path=/; "
+            f"Max-Age={int(self.hours * 3600)}"
+        )
+
+    @staticmethod
+    def clear(name=SESSION_COOKIE):
+        return f"{name}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
 
 
 class TooManyTries(Exception):
@@ -210,7 +305,6 @@ def make_server(
     engine, data_dir, bind="0.0.0.0", port=8480, max_connections=MAX_CONNECTIONS
 ):
     os.makedirs(data_dir, exist_ok=True)
-    google_signin.DAYS = auth.DAYS = SESSION_DAYS
     secret = load_secret(data_dir)
     httpd = Server((bind, int(port)), Handler, max_connections)
     httpd.trusted_proxies = proxy_list(
@@ -219,12 +313,21 @@ def make_server(
     httpd.limiter = FailureLimiter()
     httpd.engine = engine
     httpd.secret = secret
-    httpd.auth = auth.Auth(data_dir, secret, AUTH_COOKIE)
-    httpd.google = google_signin.Google(secret, AUTH_COOKIE)
+    httpd.auth = auth.Auth(data_dir, secret, SESSION_COOKIE)
+    httpd.google = DoorGoogle(secret, SESSION_COOKIE, engine.db)
+    httpd.sessions = Sessions(engine.db)
     httpd.public_hosts = host_list("PUBLIC_HOSTS")
     httpd.allowed_hosts = host_list("ALLOWED_HOSTS")
     if not httpd.google.ready():
-        log.warning("Google sign-in is not set up (GOOGLE_* settings in .env).")
+        log.warning(
+            "Google sign-in is not set up or nobody may use it (GOOGLE_* settings "
+            "in .env, People list)."
+        )
+    if httpd.google.domains:
+        log.warning(
+            "GOOGLE_ALLOWED_DOMAINS is set: every account on %s may sign in.",
+            ", ".join(httpd.google.domains),
+        )
     if not httpd.public_hosts:
         log.warning("PUBLIC_HOSTS is empty: nobody can sign in.")
     return httpd
@@ -257,6 +360,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in (extra or {}).items():
             self.send_header(k, v)
+        for c in getattr(self, "clear_cookies", ()):
+            self.send_header("Set-Cookie", c)
         self.end_headers()
         self.wfile.write(body)
 
@@ -386,6 +491,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self, method):
         self.user = None
+        self.session = None
+        self.clear_cookies = []
         try:
             self.route(method)
         except SignInRequired:
@@ -453,14 +560,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.password_login()
 
         # ---- the gate ----
-        cookie = self.jar(AUTH_COOKIE)
-        admin = self.server.auth.verify(cookie) if cookie else None
+        if self.jar(OLD_COOKIE):
+            # 1.1.0 and older stateless cookies are never accepted; clear them.
+            self.clear_cookies.append(Sessions.clear(OLD_COOKIE))
+        self.session = self.current_session()
         # Break-glass sessions are shown and logged as "admin:NAME", never like an email.
-        self.user = (
-            "admin:" + admin
-            if admin
-            else (self.server.google.verify(cookie) if cookie else None)
-        )
+        self.user = self.session["user"] if self.session else None
         if not self.user:
             if method == "GET" and path in ("/", "/index.html"):
                 return self.static("login.html")
@@ -483,6 +588,49 @@ class Handler(BaseHTTPRequestHandler):
                     self.check_csrf()
                 return getattr(self, "api_" + name)(*match.groups())
         raise LookupError("Not found.")
+
+    # ---- sessions ----
+    def current_session(self):
+        """The session row for this request's cookie if it exists, has not expired and
+        its person is still allowed; otherwise None (and the row is deleted)."""
+        sessions = self.server.sessions
+        sessions.purge()  # expired rows go at most once an hour
+        sid = self.jar(SESSION_COOKIE)
+        if not sid:
+            return None
+        row = sessions.lookup(sid)
+        if not row:
+            self.clear_cookies.append(Sessions.clear())
+            return None
+        if not self.still_allowed(row):
+            sessions.delete(sid)
+            self.clear_cookies.append(Sessions.clear())
+            log.info("session ended: %s is no longer allowed", row["user"])
+            return None
+        return row
+
+    def still_allowed(self, row):
+        if row["kind"] == "google":
+            return self.server.google.allowed(row["user"])
+        if row["kind"] == "admin" and row["user"].startswith("admin:"):
+            acct = self.server.auth.load().get(row["user"][len("admin:") :])
+            # set-password gives a new gen and remove-user deletes the account.
+            return bool(
+                acct and row["gen"] and hmac.compare_digest(acct["gen"], row["gen"])
+            )
+        return False
+
+    def is_admin(self):
+        """Admins manage the People list: a Google session whose email is in
+        GOOGLE_ALLOWED_EMAILS. Break-glass admin:NAME is not an admin for this."""
+        s = self.session
+        return bool(
+            s and s["kind"] == "google" and self.server.google.is_admin(s["user"])
+        )
+
+    def require_admin(self):
+        if not self.is_admin():
+            raise PermissionError("Only admins can see or change the People list.")
 
     # ---- sign-in ----
     def google_url(self):
@@ -526,16 +674,26 @@ class Handler(BaseHTTPRequestHandler):
             )
         except PermissionError as e:
             log.warning("google sign-in refused: %s (%s)", e, self.ip())
+            # AC41: refusals (for example a fair account not on the list) are logged.
+            self.engine.db.log(
+                "",
+                "sign-in refused",
+                "web",
+                False,
+                str(e)[:300],
+                kind="signin",
+            )
             return self.send(403, google_signin.page(str(e)), HTML)
         log.info("signed in with Google: %s (%s)", email, self.ip())
         self.engine.db.log(
             "", "sign-in", "web", True, "signed in", user=email, kind="signin"
         )
+        sid = self.server.sessions.create(email, "google", ip=self.ip())
         return self.send(
             200,
             google_signin.page(),
             HTML,
-            {"Set-Cookie": g.cookie_header(g.issue(email))},
+            {"Set-Cookie": self.server.sessions.cookie(sid)},
         )
 
     def password_login(self):
@@ -569,8 +727,10 @@ class Handler(BaseHTTPRequestHandler):
             user="admin:" + name,
             kind="signin",
         )
+        gen = a.load()[name]["gen"]
+        sid = self.server.sessions.create("admin:" + name, "admin", gen, ip)
         return self.send(
-            200, {"ok": True}, extra={"Set-Cookie": a.cookie_header(a.issue(name))}
+            200, {"ok": True}, extra={"Set-Cookie": self.server.sessions.cookie(sid)}
         )
 
     # ---- API (signed in) ----
@@ -582,7 +742,12 @@ class Handler(BaseHTTPRequestHandler):
             cookie = v + "." + self.sign(v)
         return self.send(
             200,
-            {"csrf": self.sign(cookie), "user": self.user, "version": VERSION},
+            {
+                "csrf": self.sign(cookie),
+                "user": self.user,
+                "admin": self.is_admin(),
+                "version": VERSION,
+            },
             extra={
                 "Set-Cookie": f"{CSRF_COOKIE}={cookie}; HttpOnly; Secure; "
                 f"SameSite=Strict; Path=/; Max-Age={CSRF_MAX_AGE}"
@@ -590,12 +755,9 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def api_logout(self):
-        # Sessions are stateless: this clears the browser's cookie only.
-        return self.send(
-            200,
-            {"ok": True},
-            extra={"Set-Cookie": self.server.auth.cookie_header("", clear=True)},
-        )
+        # Deletes the session row, so the id is useless even if it was copied.
+        self.server.sessions.delete(self.jar(SESSION_COOKIE))
+        return self.send(200, {"ok": True}, extra={"Set-Cookie": Sessions.clear()})
 
     def api_doors(self):
         return self.send(200, self.engine.status())
@@ -662,6 +824,86 @@ class Handler(BaseHTTPRequestHandler):
                 "alerts": e.notifier.stats(),
             },
         )
+
+    # ---- People (admins only) ----
+    def api_people(self):
+        self.require_admin()
+        g = self.server.google
+        return self.send(
+            200,
+            {
+                "admins": list(g.admins),
+                "people": [
+                    {
+                        "email": p["email"].lower(),
+                        "added_by": p["added_by"] or "",
+                        "added_at": p["added_at"],
+                    }
+                    for p in self.engine.db.people()
+                ],
+            },
+        )
+
+    def api_add_person(self):
+        self.require_admin()
+        email = people.clean_email(self.body(4000).get("email"))
+        if self.server.google.is_admin(email):
+            raise ValueError(
+                "%s is an admin (set in .env) and can already sign in." % email
+            )
+        db = self.engine.db
+        if len(db.people()) >= MAX_PEOPLE:
+            raise ValueError("The People list is full (%d)." % MAX_PEOPLE)
+        if not db.person_add(email, self.user):
+            raise ValueError("%s is already on the People list." % email)
+        db.log(
+            "",
+            "people add",
+            "web",
+            True,
+            "added %s to People" % email,
+            user=self.user,
+            kind="people",
+        )
+        self.engine.notifier.alert(
+            "people",
+            "People: %s added %s. They can now sign in to Door Control."
+            % (self.user, email),
+        )
+        return self.send(201, {"ok": True, "email": email})
+
+    def api_remove_person(self):
+        self.require_admin()
+        b = self.body(4000)
+        email = str(b.get("email") or "").strip().lower()
+        if not email:
+            raise ValueError("Choose who to remove.")
+        if self.server.google.is_admin(email):
+            raise ValueError(
+                "%s is an admin. Admins are set in .env on the server and can't be "
+                "removed here." % email
+            )
+        if str(b.get("confirm") or "").strip().lower() != email:
+            raise ValueError("Type the email address again to confirm the removal.")
+        db = self.engine.db
+        # Removes the person and ends their sessions in one transaction.
+        if not db.person_remove(email):
+            raise LookupError("%s is not on the People list." % email)
+        db.log(
+            "",
+            "people remove",
+            "web",
+            True,
+            "removed %s from People (signed out)" % email,
+            user=self.user,
+            kind="people",
+        )
+        self.engine.notifier.alert(
+            "people",
+            "People: %s removed %s. They were signed out and can no longer sign in."
+            % (self.user, email),
+        )
+        return self.send(200, {"ok": True})
 
     def tick_soon(self):
         # The engine's tick lock: never two ticks at once; a busy tick runs once more.

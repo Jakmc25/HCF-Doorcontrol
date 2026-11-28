@@ -329,8 +329,8 @@ class WebTests(unittest.TestCase):
         threading.Thread(target=self.web.serve_forever, daemon=True).start()
         self.base = "http://127.0.0.1:%d" % self.web.server_address[1]
         # A test session: a Google cookie issued by this server, plus the CSRF token.
-        self.cookie = "doors_auth=" + self.web.google.issue(
-            "tester@hardincountyfair.org"
+        self.cookie = "__Host-doors_sid=" + self.web.sessions.create(
+            "tester@hardincountyfair.org", "google"
         )
         self.csrf = None
         code, raw = self.call("GET", "/api/bootstrap")

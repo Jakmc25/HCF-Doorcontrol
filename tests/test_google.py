@@ -46,12 +46,16 @@ ENV = {
     "ALLOWED_HOSTS": LAN,
     "GOOGLE_CLIENT_ID": CLIENT_ID,
     "GOOGLE_CLIENT_SECRET": "shh",
-    "GOOGLE_ALLOWED_DOMAINS": "hardincountyfair.org",
-    "GOOGLE_ALLOWED_EMAILS": "",
+    # As on fair-server from 1.2.0 (AC41): admins only, no domain-wide access.
+    "GOOGLE_ALLOWED_DOMAINS": "",
+    "GOOGLE_ALLOWED_EMAILS": "jake@hardincountyfair.org,kolt@hardincountyfair.org",
     # The test client connects from loopback and plays cloudflared (the trusted proxy).
     "TRUSTED_PROXIES": "127.0.0.1/32",
 }
 JAKE = "jake@hardincountyfair.org"
+KOLT = "kolt@hardincountyfair.org"
+ANN = "ann@hardincountyfair.org"
+SID = web.SESSION_COOKIE
 PASSWORD = "correct horse battery staple"
 
 # Every route that needs a session, as (method, pattern) in web.py and an example path.
@@ -67,6 +71,9 @@ ROUTES = [
     ("GET", r"/api/upcoming", "/api/upcoming"),
     ("GET", r"/api/log", "/api/log"),
     ("GET", r"/api/health", "/api/health"),
+    ("GET", r"/api/people", "/api/people"),
+    ("POST", r"/api/people", "/api/people"),
+    ("POST", r"/api/people/remove", "/api/people/remove"),
 ]
 CHANGE_ROUTES = [
     ("POST", "/api/doors/d1/action", {"action": "unlock_for", "minutes": 30}),
@@ -94,6 +101,8 @@ CHANGE_ROUTES = [
     ),
     ("DELETE", "/api/schedules/1", None),
     ("POST", "/api/logout", None),
+    ("POST", "/api/people", {"email": ANN}),
+    ("POST", "/api/people/remove", {"email": ANN, "confirm": ANN}),
 ]
 
 
@@ -204,8 +213,9 @@ class Stack:
         return out
 
     # ---- sessions ----
-    def session(self, email=JAKE):
-        return "doors_auth=" + self.web.google.issue(email)
+    def session(self, email=JAKE, kind="google", gen=None):
+        """A server-side session made directly (as a sign-in would), as a Cookie value."""
+        return SID + "=" + self.web.sessions.create(email, kind, gen)
 
     def with_csrf(self, cookie):
         r = self.call("GET", "/api/bootstrap", cookie=cookie)
@@ -315,7 +325,7 @@ class GateTests(Base):
                         self.assertEqual(r.status, 401)
                         self.assertLessEqual(set(r.json()), {"error", "signin"})
                         self.assertNotIn(b"Event Center", r.body)
-                        self.assertIsNone(r.cookie("doors_auth"))
+                        self.assertIsNone(r.cookie(SID))
         self.assertEqual(len(self.st.mock.calls), calls, "no UniFi call")
         self.assertEqual(self.st.eng.db.schedules(), before_sched)
         self.assertEqual(self.st.log_rows(), before_log)
@@ -363,35 +373,27 @@ class GateTests(Base):
                 self.assertRegex(css, r"\." + re.escape(cls) + r"\b")
 
     def test_bad_session_cookies_rejected(self):
-        g = self.st.web.google
-        good = g.issue(JAKE)
-        n = base64.urlsafe_b64encode(JAKE.encode()).decode().rstrip("=")
-        exp = str(int(time.time()) - 1)
-        expired = f"g.{n}.{exp}.{g.mac(f'g.{n}.{exp}.{g.policy}')}"
-        with mock.patch.dict(os.environ, {"GOOGLE_ALLOWED_DOMAINS": "example.org"}):
-            other_policy = google_signin.Google(self.st.web.secret, "doors_auth")
-        wrong_policy = other_policy.issue(JAKE)
-        other = google_signin.Google(b"another-secret", "doors_auth")
-        self.st.web.auth.set_password("admin", PASSWORD)
-        pw = self.st.web.auth.issue("admin")
+        st = self.st
+        good = st.session()
+        sid = good.split("=", 1)[1]
+        stored = st.eng.db.conn.execute("SELECT id_hash FROM sessions").fetchone()[0]
+        # 1.1.0's stateless cookie, still correctly signed with this server's secret.
+        g = google_signin.Google(st.web.secret, "doors_auth")
+        old = "doors_auth=" + g.issue(JAKE)
         bad = {
-            "forged": f"g.{n}.9999999999." + "0" * 64,
-            "tampered mac": good[:-1] + ("0" if good[-1] != "0" else "1"),
-            "swapped email": good.replace(
-                n, base64.urlsafe_b64encode(b"ann@hardincountyfair.org").decode()
-            ),
-            "expired": expired,
-            "wrong policy": wrong_policy,
-            "other secret": other.issue(JAKE),
-            "password tampered": pw[:-1] + ("0" if pw[-1] != "0" else "1"),
-            "garbage": "x",
+            "random id": SID + "=" + "A" * 43,
+            "tampered id": SID + "=" + sid[:-1] + ("A" if sid[-1] != "A" else "B"),
+            "stored hash as id": SID + "=" + stored,
+            "empty": SID + "=",
+            "too long": SID + "=" + "a" * 500,
+            "old stateless cookie": old,
+            "old cookie name with new id": "doors_auth=" + sid,
+            "garbage": SID + "=x",
         }
-        self.assertEqual(
-            self.st.call("GET", "/api/doors", cookie="doors_auth=" + good).status, 200
-        )
+        self.assertEqual(st.call("GET", "/api/doors", cookie=good).status, 200)
         for label, value in bad.items():
             with self.subTest(label):
-                r = self.st.call("GET", "/api/doors", cookie="doors_auth=" + value)
+                r = st.call("GET", "/api/doors", cookie=value)
                 self.assertEqual(r.status, 401)
 
     def test_changes_need_csrf_and_same_origin(self):
@@ -419,7 +421,7 @@ class GateTests(Base):
                 with self.subTest(route=method + " " + path, case=label):
                     r = self.st.call(method, path, HOST, body, ck, headers)
                     self.assertEqual(r.status, 403)
-                    self.assertIsNone(r.cookie("doors_auth"))
+                    self.assertIsNone(r.cookie(SID))
         time.sleep(0.2)
         self.assertEqual(puts(), [], "no door changed")
         self.assertEqual(self.st.eng.db.schedules(), before_sched)
@@ -496,7 +498,7 @@ class HostTests(Base):
             "POST", "/api/login", LAN, {"name": "admin", "password": PASSWORD}
         )
         self.assertEqual(r.status, 403)
-        self.assertIsNone(r.cookie("doors_auth"))
+        self.assertIsNone(r.cookie(SID))
 
     def test_empty_allowed_hosts_refuses(self):
         st = Stack({"ALLOWED_HOSTS": ""})
@@ -512,8 +514,8 @@ class GoogleTests(Base):
         r = self.st.google("Jake@HardinCountyFair.org")
         self.assertEqual(r.status, 200)
         self.assertIn(b'http-equiv="refresh"', r.body)
-        ck = r.cookie("doors_auth").split(";")[0]
-        self.assertTrue(ck.startswith("doors_auth=g."))
+        ck = r.cookie(SID).split(";")[0]
+        self.assertRegex(ck, "^" + re.escape(SID) + r"=[A-Za-z0-9_-]{43}$")
         self.assertEqual(
             self.st.call("GET", "/api/bootstrap", cookie=ck).json()["user"], JAKE
         )
@@ -544,42 +546,49 @@ class GoogleTests(Base):
                 old_state, old_state, error="access_denied"
             ),
         }
-        before = st.log_rows()
+        before = len(st.log_rows())
         for label, attempt in cases.items():
             with self.subTest(label):
                 with self.assertLogs("doorcontrol", "WARNING") as logs:
                     r = attempt()
                 self.assertEqual(r.status, 403)
-                self.assertIsNone(r.cookie("doors_auth"))
+                self.assertIsNone(r.cookie(SID))
                 self.assertIn(b"Sign-in problem", r.body)
                 self.assertNotIn(b"Traceback", r.body)
                 self.assertTrue(
                     any("google sign-in refused" in line for line in logs.output)
                 )
-        self.assertEqual(st.log_rows(), before, "refusals go to the server log only")
+        # 1.2.0 (AC41): every refusal is also an activity-log row (sign-in kind, failed).
+        rows = st.log_rows()[: len(cases)]
+        self.assertEqual(len(st.log_rows()), before + len(cases))
+        for row in rows:
+            self.assertEqual(
+                (row["action"], row["ok"], row["kind"], row["user"]),
+                ("sign-in refused", 0, "signin", ""),
+            )
+        self.assertEqual(st.eng.db.sessions_list(), [], "no session for a refusal")
 
-    def test_outside_account_refused_without_allowed_emails(self):
-        self.assertEqual(ENV["GOOGLE_ALLOWED_EMAILS"], "")
-        self.assertEqual(self.st.web.google.emails, [])
+    def test_outside_account_refused(self):
+        self.assertEqual(self.st.web.google.emails, [JAKE, KOLT])
         with self.assertLogs("doorcontrol", "WARNING"):
             r = self.st.google("volunteer@gmail.com")
         self.assertEqual(r.status, 403)
-        self.assertIsNone(r.cookie("doors_auth"))
+        self.assertIsNone(r.cookie(SID))
 
-    def test_allowed_domain_change_ends_sessions(self):
-        ck = self.st.google(JAKE).cookie("doors_auth").split(";")[0]
+    def test_removed_from_env_refused_after_restart(self):
+        ck = self.st.google(KOLT).cookie(SID).split(";")[0]
         self.assertEqual(self.st.call("GET", "/api/doors", cookie=ck).status, 200)
-        # Restart with the same settings: the session survives (secret is on disk).
+        # Restart with the same settings: the session survives (it is in the database).
         same = Stack(data_dir=self.st.data)
         self.addCleanup(same.close)
         self.assertEqual(same.call("GET", "/api/doors", cookie=ck).status, 200)
-        # Restart with a different allowed domain: old sessions end.
-        changed = Stack(
-            {"GOOGLE_ALLOWED_DOMAINS": "hardincountyfair.org,example.org"},
-            data_dir=self.st.data,
-        )
+        # Restart with Kolt removed from GOOGLE_ALLOWED_EMAILS: refused at once.
+        changed = Stack({"GOOGLE_ALLOWED_EMAILS": JAKE}, data_dir=self.st.data)
         self.addCleanup(changed.close)
-        self.assertEqual(changed.call("GET", "/api/doors", cookie=ck).status, 401)
+        r = changed.call("GET", "/api/doors", cookie=ck)
+        self.assertEqual(r.status, 401)
+        self.assertEqual(attrs(r.cookie(SID))["max-age"], "0", "cookie cleared")
+        self.assertEqual(changed.eng.db.sessions_list(), [], "row deleted")
 
     def test_not_configured_404_and_app_runs(self):
         st = Stack({"GOOGLE_CLIENT_ID": "", "GOOGLE_CLIENT_SECRET": ""})
@@ -653,11 +662,13 @@ class SessionTests(Base):
         self.assertEqual(a["samesite"], "Lax")
         self.assertEqual(a["path"], "/api/auth/google/")
         self.assertEqual(a["max-age"], "600")
-        a = attrs(self.st.google(JAKE).cookie("doors_auth"))
+        a = attrs(self.st.google(JAKE).cookie(SID))
+        self.assertTrue(SID.startswith("__Host-"))
         self.assertTrue(a["httponly"] and a["secure"])
         self.assertEqual(a["samesite"], "Strict")
         self.assertEqual(a["path"], "/")
-        self.assertEqual(a["max-age"], str(14 * 86400))
+        self.assertNotIn("domain", a)
+        self.assertEqual(a["max-age"], str(12 * 3600))
         r = self.st.call("GET", "/api/bootstrap", cookie=self.st.session())
         a = attrs(r.cookie("doors_session"))
         self.assertTrue(a["httponly"] and a["secure"])
@@ -666,40 +677,396 @@ class SessionTests(Base):
     def test_sign_out_needs_csrf_and_clears_cookie(self):
         r = self.st.call("POST", "/api/logout", cookie=self.st.session())
         self.assertEqual(r.status, 403)
-        self.assertIsNone(r.cookie("doors_auth"))
+        self.assertIsNone(r.cookie(SID))
         r = self.st.change("POST", "/api/logout")
         self.assertEqual(r.status, 200)
-        c = r.cookie("doors_auth")
-        self.assertTrue(c.startswith("doors_auth=;"))
+        c = r.cookie(SID)
+        self.assertTrue(c.startswith(SID + "=;"))
         a = attrs(c)
         self.assertEqual(a["max-age"], "0")
         self.assertTrue(a["secure"] and a["httponly"])
 
     def test_lifetime_constant_and_expiry(self):
-        self.assertEqual(web.SESSION_DAYS, 14)
-        self.assertEqual(google_signin.DAYS, web.SESSION_DAYS)
-        self.assertEqual(auth.DAYS, web.SESSION_DAYS)
-        # make_server is what sets both modules from the one constant.
-        with mock.patch.object(web, "SESSION_DAYS", 3):
-            st = Stack()
-            self.addCleanup(st.close)
-            self.assertEqual((google_signin.DAYS, auth.DAYS), (3, 3))
-            a = attrs(st.google(JAKE).cookie("doors_auth"))
-            self.assertEqual(a["max-age"], str(3 * 86400))
-        Stack().close()  # back to 14
-        self.assertEqual((google_signin.DAYS, auth.DAYS), (14, 14))
-        g, au = self.st.web.google, self.st.web.auth
-        au.set_password("admin", PASSWORD)
+        self.assertEqual(web.SESSION_HOURS, 12)
+        self.assertFalse(hasattr(web, "SESSION_DAYS"))
+        sessions = self.st.web.sessions
         t0 = 2_000_000_000
-        with mock.patch("time.time", return_value=t0):
-            gv, pv = g.issue(JAKE), au.issue("admin")
-        end = t0 + 14 * 86400
-        with mock.patch("time.time", return_value=end):
-            self.assertEqual(g.verify(gv), JAKE)
-            self.assertEqual(au.verify(pv), "admin")
-        with mock.patch("time.time", return_value=end + 1):
-            self.assertIsNone(g.verify(gv))
-            self.assertIsNone(au.verify(pv))
+        sessions.clock = lambda: t0
+        ck = self.st.session()
+        sessions.clock = lambda: t0 + 12 * 3600 - 1
+        self.assertEqual(self.st.call("GET", "/api/doors", cookie=ck).status, 200)
+        sessions.clock = lambda: t0 + 12 * 3600
+        self.assertEqual(self.st.call("GET", "/api/doors", cookie=ck).status, 401)
+        self.assertEqual(self.st.eng.db.sessions_list(), [], "expired row deleted")
+
+
+# ---------------------------------------------------------------- 1.2.0 sessions (AC40)
+class ServerSessionTests(Base):
+    def test_db_stores_hash_only(self):
+        r = self.st.google(JAKE)
+        sid = r.cookie(SID).split(";")[0].split("=", 1)[1]
+        rows = [dict(x) for x in self.st.eng.db.conn.execute("SELECT * FROM sessions")]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["id_hash"], hashlib.sha256(sid.encode()).hexdigest())
+        self.assertEqual((row["user"], row["kind"]), (JAKE, "google"))
+        self.assertAlmostEqual(row["expires"] - row["created"], 12 * 3600)
+        with open(os.path.join(self.st.data, "doorcontrol.db"), "rb") as f:
+            self.assertNotIn(sid.encode(), f.read(), "the id itself is never stored")
+
+    def test_expires_after_12h(self):
+        st = self.st
+        st.web.sessions.clock = lambda: 1000.0
+        ck = st.session()
+        st.web.sessions.clock = lambda: 1000.0 + 12 * 3600 + 1
+        self.assertEqual(st.call("GET", "/api/doors", cookie=ck).status, 401)
+
+    def test_expired_rows_purged_hourly(self):
+        st = self.st
+        st.web.sessions.clock = lambda: 1000.0
+        st.session()
+        st.session(KOLT)
+        st.web.sessions.clock = lambda: 1000.0 + 13 * 3600
+        st.web.sessions._purged = 0.0
+        st.call("GET", "/api/doors")  # any request runs the hourly purge
+        self.assertEqual(st.eng.db.sessions_list(), [])
+
+    def test_manage_sessions_and_revoke(self):
+        st = self.st
+        env = {**os.environ, "DATA_DIR": st.data}
+
+        def cli(*args):
+            return subprocess.run(
+                [sys.executable, os.path.join(ROOT, "manage.py"), *args],
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=ROOT,
+            )
+
+        jake, kolt = st.session(JAKE), st.session(KOLT)
+        out = cli("sessions")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn(JAKE, out.stdout)
+        self.assertIn(KOLT, out.stdout)
+        self.assertNotIn(jake.split("=", 1)[1], out.stdout)
+        r = cli("revoke", "Jake@HardinCountyFair.org")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Ended 1 session", r.stdout)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=jake).status, 401)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=kolt).status, 200)
+        st.web.auth.set_password("admin", PASSWORD)
+        gen = st.web.auth.load()["admin"]["gen"]
+        admin = st.session("admin:admin", "admin", gen)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=admin).status, 200)
+        self.assertIn("Ended 1", cli("revoke", "admin:admin").stdout)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=admin).status, 401)
+        st.session(JAKE)
+        self.assertIn("Ended 2", cli("revoke", "--all").stdout)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=kolt).status, 401)
+        self.assertIn("Nobody is signed in", cli("sessions").stdout)
+        self.assertNotEqual(cli("revoke").returncode, 0)
+
+    def test_set_password_revokes_admin_session(self):
+        st = self.st
+        st.web.auth.set_password("admin", PASSWORD)
+        r = st.call(
+            "POST",
+            "/api/login",
+            body={"name": "admin", "password": PASSWORD},
+            headers={"CF-Connecting-IP": "198.51.100.60"},
+        )
+        ck = r.cookie(SID).split(";")[0]
+        self.assertEqual(st.call("GET", "/api/doors", cookie=ck).status, 200)
+        st.web.auth.set_password("admin", PASSWORD + "!")  # new gen
+        self.assertEqual(st.call("GET", "/api/doors", cookie=ck).status, 401)
+        # remove-user too (through the CLI, which also deletes the rows).
+        st.web.auth.set_password("admin", PASSWORD)
+        r = st.call(
+            "POST",
+            "/api/login",
+            body={"name": "admin", "password": PASSWORD},
+            headers={"CF-Connecting-IP": "198.51.100.61"},
+        )
+        ck = r.cookie(SID).split(";")[0]
+        env = {**os.environ, "DATA_DIR": st.data}
+        out = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "manage.py"), "remove-user", "admin"],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=ROOT,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=ck).status, 401)
+        self.assertEqual(st.eng.db.sessions_list(), [])
+
+    def test_logout_deletes_row(self):
+        st = self.st
+        ck, token = st.with_csrf(st.session())
+        self.assertEqual(len(st.eng.db.sessions_list()), 1)
+        r = st.call(
+            "POST",
+            "/api/logout",
+            body=None,
+            cookie=ck,
+            headers={"X-CSRF-Token": token, "Origin": "https://" + HOST},
+        )
+        self.assertEqual(r.status, 200)
+        self.assertEqual(st.eng.db.sessions_list(), [])
+        self.assertEqual(st.call("GET", "/api/doors", cookie=ck).status, 401)
+
+    def test_old_doors_auth_cookie_refused(self):
+        st = self.st
+        old = google_signin.Google(st.web.secret, "doors_auth").issue(JAKE)
+        r = st.call("GET", "/api/doors", cookie="doors_auth=" + old)
+        self.assertEqual(r.status, 401)
+        c = r.cookie("doors_auth")
+        self.assertTrue(c.startswith("doors_auth=;"), "the old cookie is cleared")
+        self.assertEqual(attrs(c)["max-age"], "0")
+        # A browser with both: the new session works and the old cookie is cleared.
+        r = st.call(
+            "GET", "/api/doors", cookie="doors_auth=%s; %s" % (old, st.session())
+        )
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.cookie("doors_auth").startswith("doors_auth=;"))
+        # Stateless issue/verify of the shared modules are not used by web.py any more.
+        src = read("doorcontrol", "web.py")
+        for gone in (".issue(", ".verify(", "cookie_header(", "DAYS"):
+            self.assertNotIn(gone, src)
+
+
+# ---------------------------------------------------------------- 1.2.0 who signs in (AC41)
+class WhoSignsInTests(Base):
+    def test_only_admins_and_people_sign_in_domain_account_refused_and_logged(self):
+        st = self.st
+        self.assertEqual(st.google(JAKE).status, 200)
+        self.assertEqual(st.google(KOLT).status, 200)
+        with self.assertLogs("doorcontrol", "WARNING") as logs:
+            r = st.google(ANN)
+        self.assertEqual(r.status, 403)
+        self.assertIsNone(r.cookie(SID))
+        self.assertIn(ANN, "\n".join(logs.output))
+        row = st.log_rows()[0]
+        self.assertEqual(
+            (row["action"], row["ok"], row["kind"]), ("sign-in refused", 0, "signin")
+        )
+        self.assertIn(ANN, row["detail"])
+        # No hd hint and no domain-wide access with an empty domain list.
+        start = st.call("GET", "/api/auth/google/start").header("Location")
+        self.assertNotIn("hd=", start)
+        # Added to People by an admin: now Ann can sign in.
+        st.eng.db.person_add(ANN, JAKE)
+        self.assertEqual(st.google(ANN).status, 200)
+        self.assertEqual(st.google("Ann@HardinCountyFair.org").status, 200)
+
+    def test_all_empty_no_google_breakglass_works(self):
+        st = Stack({"GOOGLE_ALLOWED_EMAILS": "", "GOOGLE_ALLOWED_DOMAINS": ""})
+        self.addCleanup(st.close)
+        self.assertFalse(st.web.google.ready())
+        self.assertFalse(st.call("GET", "/api/login-info").json()["google"])
+        r = st.call("GET", "/api/auth/google/start")
+        self.assertEqual(r.status, 404)
+        self.assertIsNone(r.header("Location"))
+        st.web.auth.set_password("admin", PASSWORD)
+        r = st.call(
+            "POST",
+            "/api/login",
+            body={"name": "admin", "password": PASSWORD},
+            headers={"CF-Connecting-IP": "198.51.100.70"},
+        )
+        self.assertEqual(r.status, 200)
+        ck = r.cookie(SID).split(";")[0]
+        b = st.call("GET", "/api/bootstrap", cookie=ck).json()
+        self.assertEqual((b["user"], b["admin"]), ("admin:admin", False))
+
+    def test_door_google_relies_on_parent_behaviour(self):
+        """The subclass relies on the pinned parent assigning self.emails in __init__ and
+        reading self.emails in finish(), ready(), start() and allowed()."""
+        src = read("doorcontrol", "google_signin.py")
+        self.assertIn('self.emails = _list("GOOGLE_ALLOWED_EMAILS")', src)
+        self.assertIn("email in self.emails", src)
+        self.assertIn("(self.domains or self.emails)", src)
+        db = self.st.eng.db
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GOOGLE_ALLOWED_EMAILS": "Jake@HardinCountyFair.org",
+                "GOOGLE_ALLOWED_DOMAINS": "",
+            },
+        ):
+            g = web.DoorGoogle(b"s", SID, db)
+        self.assertEqual(g.admins, [JAKE])
+        self.assertEqual(g.emails, [JAKE])
+        self.assertFalse(g.allowed(ANN))
+        db.person_add(ANN, JAKE)
+        self.assertEqual(g.emails, [ANN, JAKE], "people list read live")
+        self.assertTrue(g.allowed("ANN@hardincountyfair.org"))
+        self.assertTrue(g.is_admin(JAKE))
+        self.assertFalse(g.is_admin(ANN))
+        with mock.patch.dict(
+            os.environ, {"GOOGLE_ALLOWED_EMAILS": "", "GOOGLE_ALLOWED_DOMAINS": ""}
+        ):
+            g = web.DoorGoogle(b"s", SID, db)
+        g.client_id, g.client_secret = "id", "secret"
+        self.assertTrue(g.ready(), "a listed person makes Google usable")
+        db.person_remove(ANN)
+        self.assertFalse(g.ready())
+
+
+# ---------------------------------------------------------------- 1.2.0 People (AC41a)
+class PeopleTests(Base):
+    def admin(self, method, path, body=None, email=JAKE):
+        return self.st.change(method, path, body, email=email)
+
+    def test_admin_add_validates_format_case_duplicates(self):
+        st = self.st
+        r = self.admin("POST", "/api/people", {"email": "  Ann@HardinCountyFair.ORG "})
+        self.assertEqual(r.status, 201, r.body)
+        self.assertEqual(r.json()["email"], ANN)
+        for bad, word in (
+            ("", "Type"),
+            ("ann", "email"),
+            ("ann@", "email"),
+            ("@hardincountyfair.org", "email"),
+            ("a b@hardincountyfair.org", "email"),
+            ("a@b@hardincountyfair.org", "email"),
+            ("x,y@hardincountyfair.org", "email"),
+            ("x@localhost", "email"),
+            ("x" * 250 + "@a.org", "email"),
+            (ANN.upper(), "already on the People list"),
+            (JAKE, "admin"),
+            ("KOLT@hardincountyfair.org", "admin"),
+        ):
+            with self.subTest(bad):
+                r = self.admin("POST", "/api/people", {"email": bad})
+                self.assertEqual(r.status, 400)
+                self.assertIn(word, r.json()["error"])
+        listed = self.admin("GET", "/api/people").json()
+        self.assertEqual(listed["admins"], [JAKE, KOLT])
+        self.assertEqual([p["email"] for p in listed["people"]], [ANN])
+        self.assertEqual(listed["people"][0]["added_by"], JAKE)
+
+    def test_remove_needs_typed_confirm(self):
+        st = self.st
+        st.eng.db.person_add(ANN, JAKE)
+        for confirm in (None, "", "ann", "bob@hardincountyfair.org"):
+            with self.subTest(confirm=confirm):
+                r = self.admin(
+                    "POST", "/api/people/remove", {"email": ANN, "confirm": confirm}
+                )
+                self.assertEqual(r.status, 400)
+                self.assertIn("confirm", r.json()["error"])
+        self.assertEqual(st.eng.db.people_emails(), {ANN})
+        r = self.admin(
+            "POST",
+            "/api/people/remove",
+            {"email": ANN, "confirm": " Ann@HardinCountyFair.org"},
+        )
+        self.assertEqual(r.status, 200, r.body)
+        self.assertEqual(st.eng.db.people_emails(), set())
+        r = self.admin("POST", "/api/people/remove", {"email": ANN, "confirm": ANN})
+        self.assertEqual(r.status, 404)
+
+    def test_non_admin_403(self):
+        st = self.st
+        st.eng.db.person_add(ANN, JAKE)
+        st.web.auth.set_password("admin", PASSWORD)
+        gen = st.web.auth.load()["admin"]["gen"]
+        for who, cookie in (
+            ("person", st.session(ANN)),
+            ("break-glass", st.session("admin:admin", "admin", gen)),
+        ):
+            ck, token = st.with_csrf(cookie)
+            b = st.call("GET", "/api/bootstrap", cookie=ck).json()
+            self.assertFalse(b["admin"], who)
+            h = {"X-CSRF-Token": token, "Origin": "https://" + HOST}
+            for method, path, body in (
+                ("GET", "/api/people", None),
+                ("POST", "/api/people", {"email": "bob@hardincountyfair.org"}),
+                ("POST", "/api/people/remove", {"email": ANN, "confirm": ANN}),
+            ):
+                with self.subTest(who=who, path=path, method=method):
+                    r = st.call(method, path, HOST, body, ck, h)
+                    self.assertEqual(r.status, 403)
+                    self.assertNotIn(ANN.encode(), r.body)
+        self.assertEqual(st.eng.db.people_emails(), {ANN})
+        self.assertTrue(
+            st.call("GET", "/api/bootstrap", cookie=st.session()).json()["admin"]
+        )
+
+    def test_admin_cannot_be_removed(self):
+        for who in (JAKE, KOLT.upper()):
+            r = self.admin("POST", "/api/people/remove", {"email": who, "confirm": who})
+            self.assertEqual(r.status, 400)
+            self.assertIn(".env", r.json()["error"])
+        self.assertEqual(
+            self.st.call("GET", "/api/doors", cookie=self.st.session(KOLT)).status, 200
+        )
+
+    def test_remove_ends_sessions_at_once(self):
+        st = self.st
+        st.eng.db.person_add(ANN, JAKE)
+        ann = st.google(ANN).cookie(SID).split(";")[0]
+        ann2 = st.session(ANN)
+        jake = st.session(JAKE)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=ann).status, 200)
+        r = self.admin("POST", "/api/people/remove", {"email": ANN, "confirm": ANN})
+        self.assertEqual(r.status, 200)
+        users = [s["user"] for s in st.eng.db.sessions_list()]
+        self.assertNotIn(ANN, users, "rows deleted in the same transaction")
+        for ck in (ann, ann2):
+            self.assertEqual(st.call("GET", "/api/doors", cookie=ck).status, 401)
+        self.assertEqual(st.call("GET", "/api/doors", cookie=jake).status, 200)
+        with self.assertLogs("doorcontrol", "WARNING"):
+            self.assertEqual(st.google(ANN).status, 403)
+
+    def test_add_remove_logged_and_alerted(self):
+        st = self.st
+        sent = []
+        st.eng.notifier.alert = lambda kind, text, key=None: sent.append(
+            (kind, text, key)
+        )
+        self.admin("POST", "/api/people", {"email": ANN}, email=KOLT)
+        self.admin("POST", "/api/people/remove", {"email": ANN, "confirm": ANN})
+        rows = [r for r in st.log_rows() if r["kind"] == "people"]
+        got = [(r["action"], r["user"], r["ok"]) for r in reversed(rows)]
+        self.assertEqual(got, [("people add", KOLT, 1), ("people remove", JAKE, 1)])
+        self.assertIn(ANN, rows[0]["detail"])
+        self.assertEqual([k for k, _, _ in sent], ["people", "people"])
+        self.assertIn(KOLT, sent[0][1])
+        self.assertIn(ANN, sent[0][1])
+        self.assertIn(JAKE, sent[1][1])
+        self.assertIn("signed out", sent[1][1])
+        # Refused changes write nothing and alert nothing.
+        n = len(st.log_rows())
+        self.admin("POST", "/api/people", {"email": "nope"})
+        self.admin("POST", "/api/people/remove", {"email": ANN, "confirm": "x"})
+        self.assertEqual(len(st.log_rows()), n)
+        self.assertEqual(len(sent), 2)
+
+    def test_people_are_calendar_organizers(self):
+        from doorcontrol import people
+
+        db = self.st.eng.db
+        env = {"GOOGLE_ALLOWED_EMAILS": JAKE}
+        self.assertEqual(people.allowed_organizers({}, env, db), {JAKE})
+        db.person_add(ANN, JAKE)
+        self.assertEqual(people.allowed_organizers({}, env, db), {JAKE, ANN})
+        cfg = {"allowed_organizers": ["doors@group.calendar.test"]}
+        self.assertEqual(
+            people.allowed_organizers(cfg, env, db), {"doors@group.calendar.test"}
+        )
+
+    def test_migration_adds_tables_only(self):
+        cols = lambda t: [
+            r[1] for r in self.st.eng.db.conn.execute("PRAGMA table_info(%s)" % t)
+        ]
+        self.assertEqual(
+            cols("sessions"),
+            ["id_hash", "user", "kind", "gen", "created", "expires", "ip"],
+        )
+        self.assertEqual(cols("people"), ["email", "added_by", "added_at"])
 
 
 # ---------------------------------------------------------------- break-glass
@@ -720,7 +1087,7 @@ class BreakGlassTests(Base):
         self.assertEqual(self.login("admin", "wrong", ip).status, 429)
         r = self.login("admin", PASSWORD, ip)
         self.assertEqual(r.status, 429, "even the right password waits")
-        self.assertIsNone(r.cookie("doors_auth"))
+        self.assertIsNone(r.cookie(SID))
         self.assertEqual(self.login("admin", PASSWORD, "198.51.100.18").status, 200)
 
     def test_password_signin_and_log_row(self):
@@ -728,16 +1095,16 @@ class BreakGlassTests(Base):
         r = self.login("admin", "not it", "198.51.100.30")
         self.assertEqual(r.status, 401)
         self.assertEqual(r.json(), {"error": "Wrong name or password."})
-        self.assertIsNone(r.cookie("doors_auth"))
+        self.assertIsNone(r.cookie(SID))
         with self.assertLogs("doorcontrol", "INFO") as logs:
             r = self.login("Admin", PASSWORD, "198.51.100.31")
         self.assertEqual(r.status, 200)
         self.assertNotIn(PASSWORD, "\n".join(logs.output))
-        a = attrs(r.cookie("doors_auth"))
+        a = attrs(r.cookie(SID))
         self.assertTrue(a["httponly"] and a["secure"])
         self.assertEqual(a["samesite"], "Strict")
-        self.assertEqual(a["max-age"], str(web.SESSION_DAYS * 86400))
-        ck = r.cookie("doors_auth").split(";")[0]
+        self.assertEqual(a["max-age"], str(web.SESSION_HOURS * 3600))
+        ck = r.cookie(SID).split(";")[0]
         self.assertEqual(
             self.st.call("GET", "/api/bootstrap", cookie=ck).json()["user"],
             "admin:admin",
@@ -807,7 +1174,7 @@ class BreakGlassTests(Base):
         for name, pw in (("admin", PASSWORD), ("", ""), ("admin", "")):
             r = self.login(name, pw, "198.51.100.50")
             self.assertEqual(r.status, 401)
-            self.assertIsNone(r.cookie("doors_auth"))
+            self.assertIsNone(r.cookie(SID))
         self.st.web.auth.set_password("admin", PASSWORD)
         self.assertTrue(self.st.call("GET", "/api/login-info").json()["password"])
 
@@ -891,7 +1258,10 @@ class ActivityTests(Base):
         n = len(self.st.log_rows())
         with self.assertLogs("doorcontrol", "WARNING"):
             self.st.google("someone@gmail.com")
-        self.assertEqual(len(self.st.log_rows()), n)
+        rows = self.st.log_rows()
+        self.assertEqual(len(rows), n + 1)
+        self.assertEqual((rows[0]["action"], rows[0]["ok"]), ("sign-in refused", 0))
+        self.assertIn("someone@gmail.com", rows[0]["detail"])
 
     def test_migration_is_additive(self):
         path = os.path.join(tempfile.mkdtemp(), "old.db")
@@ -1135,7 +1505,7 @@ class TrustTests(Base):
         self.assertEqual(st.call("GET", "/api/auth/google/start", HOST).status, 403)
         r = st.call("POST", "/api/login", HOST, {"name": "admin", "password": PASSWORD})
         self.assertEqual(r.status, 403)
-        self.assertIsNone(r.cookie("doors_auth"))
+        self.assertIsNone(r.cookie(SID))
         # A fake CF header on the LAN address is ignored (not remote).
         info = st.call("GET", "/api/login-info", LAN, headers=cf).json()
         self.assertFalse(info["remote"])
@@ -1403,8 +1773,9 @@ class RepoTests(unittest.TestCase):
         self.assertEqual(env["TRUSTED_PROXIES"], web.DEFAULT_TRUSTED_PROXIES)
         self.assertEqual(env["GOOGLE_CLIENT_ID"], "")
         self.assertEqual(env["GOOGLE_CLIENT_SECRET"], "")
+        # 1.2.0 (AC41): admins only; no domain-wide access.
         self.assertEqual(env["GOOGLE_ALLOWED_EMAILS"], "")
-        self.assertEqual(env["GOOGLE_ALLOWED_DOMAINS"], "hardincountyfair.org")
+        self.assertEqual(env["GOOGLE_ALLOWED_DOMAINS"], "")
         self.assertEqual(env["PUBLIC_HOSTS"], "doors.jakemc.me")
         hosts = env["ALLOWED_HOSTS"].split(",")
         for h in ("192.168.1.160:8480", "localhost:8480", "127.0.0.1:8480"):
@@ -1444,8 +1815,9 @@ class RepoTests(unittest.TestCase):
     def test_readme_documents_sign_everyone_out(self):
         readme = read("README.md")
         self.assertIn("Sign everyone out", readme)
-        self.assertIn("rm -f /data/session-secret", readme)
-        self.assertIn("SESSION_DAYS", readme)
+        self.assertIn("manage.py revoke --all", readme)
+        self.assertIn("SESSION_HOURS", readme)
+        self.assertNotIn("SESSION_DAYS", readme)
 
     def test_readme_has_no_tailscale_or_password_text(self):
         readme = read("README.md")

@@ -127,6 +127,37 @@ class CalendarAccept(unittest.TestCase):
         with mock.patch.dict(os.environ, {"GOOGLE_ALLOWED_EMAILS": ""}):
             self.assertEqual(windows(c), [])
 
+    def test_allowlist_default_admins_plus_people(self):
+        """1.2.0 (AC3 with AC41a): admins plus the in-app People list, read at each
+        refresh, the way app.py wires the calendar."""
+        from doorcontrol import people
+
+        ann = "ann@hardincountyfair.org"
+        db = DB(os.path.join(tempfile.mkdtemp(), "d.db"))
+        ics = vcal(
+            vevent("Unlock: Office", uid="j", organizer=JAKE),
+            vevent("Unlock: Office", uid="a", organizer=ann),
+        )
+        cfg = {"ical_url": "https://x/y"}
+        with mock.patch.dict(os.environ, {"GOOGLE_ALLOWED_EMAILS": JAKE}):
+            c = Calendar(
+                cfg,
+                TZ,
+                notifier=Recorder(),
+                organizers=lambda: people.allowed_organizers(cfg, db=db),
+            )
+            c.load_text(ics)
+            self.assertEqual([w["uid"] for w in windows(c)], ["j"])
+            db.person_add(ann, JAKE)
+            self.assertEqual(sorted(w["uid"] for w in windows(c)), ["a", "j"])
+            db.person_remove(ann)
+            self.assertEqual([w["uid"] for w in windows(c)], ["j"])
+        with mock.patch.dict(os.environ, {"GOOGLE_ALLOWED_EMAILS": ""}):
+            rec = Recorder()
+            self.assertTrue(app.warn_no_organizers(cfg, rec, db=db))
+            db.person_add(ann, JAKE)
+            self.assertFalse(app.warn_no_organizers(cfg, rec, db=db))
+
     def test_config_allowlist_overrides(self):
         ics = vcal(
             vevent("Unlock: Office", uid="a", organizer=JAKE),
@@ -1220,7 +1251,7 @@ def bash_ok(block):
 class Repo(unittest.TestCase):
     def test_version_agrees(self):
         v = read("VERSION").strip()
-        self.assertEqual(v, "1.1.0")
+        self.assertEqual(v, "1.2.0")
         self.assertIn("image: door-control:%s\n" % v, read("compose.yaml"))
         self.assertEqual(
             read("README.md").splitlines()[0], "# Fairgrounds Door Control " + v

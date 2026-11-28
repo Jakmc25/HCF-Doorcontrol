@@ -48,14 +48,14 @@ def check_unifi(u, env=None):
     return "pinned" if u.get("cert_sha256") else "verified"
 
 
-def warn_no_organizers(cal_cfg, notifier, env=None):
+def warn_no_organizers(cal_cfg, notifier, env=None, db=None):
     """AC3: a feed is set up but nobody may create unlock events -> one startup alert."""
-    if cal_cfg.get("ical_url") and not people.allowed_organizers(cal_cfg, env):
+    if cal_cfg.get("ical_url") and not people.allowed_organizers(cal_cfg, env, db):
         notifier.alert(
             "calendar",
             "A calendar feed is set up, but nobody is allowed to create unlock events "
-            "(calendar.allowed_organizers and GOOGLE_ALLOWED_EMAILS are both empty). "
-            "Calendar events open no doors.",
+            "(calendar.allowed_organizers, GOOGLE_ALLOWED_EMAILS and the People list "
+            "are all empty). Calendar events open no doors.",
             key=("calendar", "no-organizers"),
         )
         return True
@@ -138,12 +138,21 @@ def main(argv=None):
     if not notifier.enabled:
         log.info("Telegram alerts are off (no bot token or no private allowed chats).")
 
+    db = DB(db_path)
+    # Organizers default to the admins plus the in-app People list, read at each refresh.
     calendar = (
-        Calendar(cal_cfg, tz, notifier=notifier) if cal_cfg.get("ical_url") else None
+        Calendar(
+            cal_cfg,
+            tz,
+            notifier=notifier,
+            organizers=lambda: people.allowed_organizers(cal_cfg, db=db),
+        )
+        if cal_cfg.get("ical_url")
+        else None
     )
-    warn_no_organizers(cal_cfg, notifier)
+    warn_no_organizers(cal_cfg, notifier, db=db)
     warn_dev_mode(mode, notifier)
-    engine = Engine(cfg, DB(db_path), client, calendar, notifier)
+    engine = Engine(cfg, db, client, calendar, notifier)
 
     if calendar:
         calendar.start()

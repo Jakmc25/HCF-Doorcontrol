@@ -310,6 +310,142 @@ test("calendar not read yet notice; ok, off and errors hide it", async () => {
   assert.match(html, /<div[^>]*id="calnotice"[^>]*hidden/);
 });
 
+// ---- Settings › People (1.2.0, AC41a) ----
+const PEOPLE = {
+  admins: ["jake@hardincountyfair.org", "kolt@hardincountyfair.org"],
+  people: [
+    {
+      email: "ann<b>@hardincountyfair.org",
+      added_by: "jake@hardincountyfair.org",
+      added_at: 1,
+    },
+  ],
+};
+function asAdmin(extra = {}) {
+  return dashboardResponses({
+    "GET /api/bootstrap": {
+      status: 200,
+      body: {
+        csrf: "tok123",
+        user: "jake@hardincountyfair.org",
+        admin: true,
+        version: "1.2.0",
+      },
+    },
+    "GET /api/people": { status: 200, body: PEOPLE },
+    ...extra,
+  });
+}
+const button = (dataset) => {
+  const b = { dataset };
+  b.closest = () => b;
+  return b;
+};
+
+test("People section hidden and never loaded for non-admins", async () => {
+  const { $, calls } = load("app.js", dashboardResponses());
+  $("people-section").hidden = true; // as in index.html
+  await settle();
+  assert.strictEqual($("people-section").hidden, true);
+  assert.ok(!calls.some((c) => c.url === "/api/people"), "never requested");
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.match(html, /<section[^>]*id="people-section"[^>]*hidden/);
+  assert.match(html, /<div[^>]*id="people-confirm"[^>]*hidden/);
+});
+
+test("admins see People: admins marked, list escaped, Remove only for people", async () => {
+  const { $ } = load("app.js", asAdmin());
+  $("people-section").hidden = true;
+  await settle();
+  assert.strictEqual($("people-section").hidden, false);
+  const html = $("people").innerHTML;
+  assert.match(html, /jake@hardincountyfair\.org/);
+  assert.match(html, /change in \.env/);
+  assert.match(html, /ann&lt;b&gt;@hardincountyfair\.org/);
+  assert.doesNotMatch(html, /ann<b>/);
+  const removes = [...html.matchAll(/data-remove="([^"]*)"/g)].map((m) => m[1]);
+  assert.deepStrictEqual(removes, ["ann&lt;b&gt;@hardincountyfair.org"]);
+});
+
+test("add person posts the email with the CSRF token", async () => {
+  const { $, calls } = load(
+    "app.js",
+    asAdmin({
+      "POST /api/people": {
+        status: 201,
+        body: { ok: true, email: "bob@hardincountyfair.org" },
+      },
+    }),
+  );
+  await settle();
+  $("people-email").value = "Bob@HardinCountyFair.org";
+  await $("people-form").fire("submit", { preventDefault() {} });
+  const post = calls.find(
+    (c) => c.method === "POST" && c.url === "/api/people",
+  );
+  assert.deepStrictEqual(JSON.parse(post.body), {
+    email: "Bob@HardinCountyFair.org",
+  });
+  assert.strictEqual(post.headers["X-CSRF-Token"], "tok123");
+  assert.strictEqual($("people-email").value, "");
+  assert.match($("toast").textContent, /bob@hardincountyfair\.org added/);
+});
+
+test("remove needs the email typed again; button disabled until it matches", async () => {
+  const ann = "ann@hardincountyfair.org";
+  const { $, calls } = load(
+    "app.js",
+    asAdmin({
+      "GET /api/people": {
+        status: 200,
+        body: { admins: PEOPLE.admins, people: [{ email: ann, added_by: "" }] },
+      },
+      "POST /api/people/remove": { status: 200, body: { ok: true } },
+    }),
+  );
+  $("people-confirm").hidden = true;
+  await settle();
+  await $("people").fire("click", { target: button({ remove: ann }) });
+  assert.strictEqual($("people-confirm").hidden, false);
+  assert.match(
+    $("people-confirm-text").textContent,
+    /ann@hardincountyfair\.org/,
+  );
+  assert.strictEqual($("people-confirm-btn").disabled, true);
+  for (const typed of ["", "ann", "bob@hardincountyfair.org"]) {
+    $("people-confirm-input").value = typed;
+    await $("people-confirm-input").fire("input", {});
+    assert.strictEqual($("people-confirm-btn").disabled, true, typed);
+  }
+  assert.ok(!calls.some((c) => c.url === "/api/people/remove"));
+  $("people-confirm-input").value = " Ann@HardinCountyFair.org";
+  await $("people-confirm-input").fire("input", {});
+  assert.strictEqual($("people-confirm-btn").disabled, false);
+  await $("people-confirm-btn").fire("click", {});
+  const post = calls.find((c) => c.url === "/api/people/remove");
+  assert.strictEqual(post.method, "POST");
+  assert.strictEqual(post.headers["X-CSRF-Token"], "tok123");
+  assert.deepStrictEqual(JSON.parse(post.body), {
+    email: ann,
+    confirm: " Ann@HardinCountyFair.org",
+  });
+  assert.strictEqual($("people-confirm").hidden, true, "closed after");
+  assert.match($("toast").textContent, /removed and signed out/);
+});
+
+test("remove cancel closes the confirmation without a request", async () => {
+  const { $, calls } = load("app.js", asAdmin());
+  await settle();
+  await $("people").fire("click", {
+    target: button({ remove: "ann<b>@hardincountyfair.org" }),
+  });
+  await $("people-confirm-cancel").fire("click", {});
+  assert.strictEqual($("people-confirm").hidden, true);
+  assert.strictEqual($("people-confirm-btn").disabled, true);
+  await $("people-confirm-btn").fire("click", {});
+  assert.ok(!calls.some((c) => c.url === "/api/people/remove"));
+});
+
 function loginInfo(info) {
   return { "GET /api/login-info": { status: 200, body: info } };
 }
