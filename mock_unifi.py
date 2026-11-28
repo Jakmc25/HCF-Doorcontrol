@@ -8,7 +8,7 @@ import re
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = "test-token"
 
@@ -41,6 +41,18 @@ class Mock:
         self.rules = {k: {"type": "schedule", "ended_time": 0} for k in self.doors}
         self.calls = []  # (method, path, body)
         self.fail = False
+        self.hang = 0  # seconds to wait before answering (timeouts, overlapping ticks)
+        self.fail_paths = []  # (method, path regex): answer those with HTTP 500
+
+    def set_by_hand(self, door_id, rule_type):
+        """Someone changes a door in the UniFi app (not through Door Control)."""
+        self.rules[door_id] = {"type": rule_type, "ended_time": 0}
+        self.doors[door_id]["door_lock_relay_status"] = (
+            "unlock" if rule_type in ("keep_unlock", "custom") else "lock"
+        )
+
+    def puts(self):
+        return [c for c in self.calls if c[0] == "PUT"]
 
 
 def make_server(mock, port=0, ssl_context=None):
@@ -52,11 +64,14 @@ def make_server(mock, port=0, ssl_context=None):
             body = json.dumps(
                 {"code": code_str, "msg": "success", "data": data}
             ).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # the client gave up (timeout tests)
 
         def _handle(self, method):
             n = int(self.headers.get("Content-Length") or 0)
@@ -64,7 +79,11 @@ def make_server(mock, port=0, ssl_context=None):
             if self.headers.get("Authorization") != "Bearer " + TOKEN:
                 return self._reply(401, None, "CODE_UNAUTHORIZED")
             mock.calls.append((method, self.path, body))
-            if mock.fail:
+            if mock.hang:
+                time.sleep(mock.hang)
+            if mock.fail or any(
+                m == method and re.fullmatch(p, self.path) for m, p in mock.fail_paths
+            ):
                 return self._reply(500, None, "CODE_SYSTEM_ERROR")
             if method == "GET" and self.path == "/api/v1/developer/doors":
                 return self._reply(200, list(mock.doors.values()))
@@ -93,7 +112,8 @@ def make_server(mock, port=0, ssl_context=None):
         def do_PUT(self):
             self._handle("PUT")
 
-    srv = HTTPServer(("127.0.0.1", port), H)
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    srv.daemon_threads = True
     if ssl_context:  # HTTPS like the real console (tests of certificate pinning)
         srv.socket = ssl_context.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

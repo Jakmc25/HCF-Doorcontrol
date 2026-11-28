@@ -4,19 +4,21 @@ Run inside the container as its normal user, never as root:
     docker compose exec app python manage.py set-password admin
     docker compose exec app python manage.py users
     docker compose exec app python manage.py remove-user admin
+    docker compose exec app python manage.py backup
 
 Passwords are stored only as scrypt hashes in DATA_DIR/accounts.json (mode 600).
 There is no way to create or change an account from the web.
+`backup` writes the same backup as the daily one (DATA_DIR/backups, 14 kept) and prints its path.
 """
 
 import getpass
 import os
 import sys
 
-from doorcontrol import auth
+from doorcontrol import auth, backup
 
 MIN_PASSWORD = 12
-USAGE = "Usage: python manage.py set-password NAME | users | remove-user NAME"
+USAGE = "Usage: python manage.py set-password NAME | users | remove-user NAME | backup"
 
 
 def accounts(data_dir):
@@ -61,6 +63,14 @@ def main(argv):
         except ValueError as e:
             raise SystemExit(str(e))
         print("Removed", argv[1])
+    elif cmd == ["backup"] and len(argv) == 1:
+        config = os.environ.get("DOORCONTROL_CONFIG") or os.path.join(
+            data_dir, "config.json"
+        )
+        try:
+            print(backup.run(data_dir, config))
+        except Exception as e:
+            raise SystemExit("Backup failed: %s" % e)
     else:
         raise SystemExit(USAGE)
 

@@ -1,9 +1,18 @@
-"""Telegram control: long-polling bot using only the standard library."""
+"""Telegram control: long-polling bot using only the standard library.
 
+Safety (1.1.0): the update offset is kept in the database and stored before each update is
+handled, so a restart never replays a door command; messages older than max_age_seconds are
+dropped without action or reply; each chat may send max_commands_per_minute commands; only
+private text messages are handled (groups, channels, edits and callbacks are ignored); door
+actions are logged as telegram:<chat id>/<name>.
+"""
+
+import collections
 import json
 import logging
 import re
 import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -62,15 +71,31 @@ def fmt_schedule(s, names):
     )
 
 
+OFFSET_KEY = "telegram_offset"
+SLOW_DOWN = "Slow down: wait a minute."
+
+
+def who(chat_id, name=""):
+    """Activity-log user for a Telegram action: telegram:<chat id>/<name>, never empty."""
+    clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:40]
+    return "telegram:%s/%s" % (chat_id, clean or "?")
+
+
 class Bot:
-    def __init__(self, cfg, engine):
+    def __init__(self, cfg, engine, api=None, clock=time.time):
         self.token = cfg.get("token", "")
         self.allowed = {int(x) for x in cfg.get("allowed_chat_ids", [])}
         self.engine = engine
+        self.max_age = int(cfg.get("max_age_seconds", 120))
+        self.max_per_minute = max(1, int(cfg.get("max_commands_per_minute", 10)))
+        self._api_fn = api
+        self.clock = clock
+        self._recent = {}
+        self._warned = {}
         self._stop = threading.Event()
 
     # ---- command handling (pure, testable) ----
-    def handle(self, chat_id, text):
+    def handle(self, chat_id, text, name=""):
         text = (text or "").strip()
         if not text.startswith("/"):
             return "Send /help to see what I can do."
@@ -86,13 +111,13 @@ class Bot:
         if cmd in ("/start", "/help"):
             return HELP
         try:
-            return self._run(cmd, rest.strip())
+            return self._run(cmd, rest.strip(), who(chat_id, name))
         except (DoorError, ValueError) as e:
             return str(e)
         except UnifiError as e:
             return "UniFi problem: %s" % e
 
-    def _run(self, cmd, rest):
+    def _run(self, cmd, rest, user):
         e = self.engine
         if cmd == "/doors":
             lines = []
@@ -143,10 +168,75 @@ class Bot:
         if cmd == "/unlock":
             rest, minutes = split_duration(rest)
         door = e.find_door(rest)
-        desc = e.door_action(door, table[cmd], minutes, source="telegram")
+        desc = e.door_action(door, table[cmd], minutes, source="telegram", user=user)
         return "%s: %s" % (door["name"], desc)
 
+    # ---- updates (testable without a network) ----
+    def _rate_limited(self, chat, now):
+        """None: go ahead. Otherwise the reply to send ("" = send nothing)."""
+        q = self._recent.setdefault(chat, collections.deque())
+        while q and now - q[0] >= 60:
+            q.popleft()
+        if len(q) >= self.max_per_minute:
+            if now - self._warned.get(chat, -1e18) >= 60:
+                self._warned[chat] = now
+                return SLOW_DOWN
+            return ""
+        q.append(now)
+        return None
+
+    def process_update(self, u):
+        """One update from getUpdates -> (chat id, reply) or None (nothing to send)."""
+        msg = u.get("message")
+        if not isinstance(msg, dict):
+            return None  # callback_query, edited_message, channel_post, ...
+        chat = msg.get("chat") or {}
+        text = msg.get("text")
+        if chat.get("type") != "private" or not text or "id" not in chat:
+            return None
+        chat_id = chat["id"]
+        now = self.clock()
+        cmd = str(text).strip().split(" ")[0][:32]
+        try:
+            age = now - float(msg.get("date") or 0)
+        except (TypeError, ValueError):
+            age = float("inf")
+        if age > self.max_age:
+            log.info(
+                "telegram: dropped a %d s old message from chat %s (%s)",
+                min(age, 10**9),
+                chat_id,
+                cmd,
+            )
+            return None
+        limited = self._rate_limited(chat_id, now)
+        if limited is not None:
+            log.info("telegram: chat %s is over the command limit (%s)", chat_id, cmd)
+            return (chat_id, limited) if limited else None
+        frm = msg.get("from") or {}
+        name = frm.get("username") or frm.get("first_name") or ""
+        return chat_id, self.handle(chat_id, text, name)
+
+    def poll_once(self, timeout=25):
+        db = self.engine.db
+        try:
+            offset = int(db.kv_get(OFFSET_KEY, 0) or 0)
+        except ValueError:
+            offset = 0
+        res = self.api("getUpdates", {"timeout": timeout, "offset": offset})
+        for u in res.get("result", []):
+            # Stored BEFORE handling: a crash never runs a door command twice.
+            db.kv_set(OFFSET_KEY, int(u["update_id"]) + 1)
+            out = self.process_update(u)
+            if out and out[1]:
+                self.api("sendMessage", {"chat_id": out[0], "text": out[1]})
+
     # ---- network loop ----
+    def api(self, method, params, timeout=40):
+        if self._api_fn:
+            return self._api_fn(method, params)
+        return self._api(method, params, timeout)
+
     def _api(self, method, params, timeout=40):
         url = "https://api.telegram.org/bot%s/%s" % (self.token, method)
         data = urllib.parse.urlencode(params).encode()
@@ -161,18 +251,10 @@ class Bot:
         threading.Thread(target=self._loop, daemon=True, name="telegram").start()
 
     def _loop(self):
-        offset = 0
         while not self._stop.is_set():
             try:
-                res = self._api("getUpdates", {"timeout": 25, "offset": offset})
-                for u in res.get("result", []):
-                    offset = u["update_id"] + 1
-                    msg = u.get("message") or {}
-                    if msg.get("text") and msg.get("chat", {}).get("type") == "private":
-                        reply = self.handle(msg["chat"]["id"], msg["text"])
-                        self._api(
-                            "sendMessage", {"chat_id": msg["chat"]["id"], "text": reply}
-                        )
+                self.poll_once()
             except Exception as ex:
-                log.warning("telegram: %s", ex)
+                text = str(ex).replace(self.token, "[hidden]") if self.token else ex
+                log.warning("telegram: %s: %s", type(ex).__name__, text)
                 self._stop.wait(10)

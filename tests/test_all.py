@@ -201,6 +201,8 @@ class EngineTests(unittest.TestCase):
 ICS = """BEGIN:VCALENDAR
 BEGIN:VEVENT
 UID:a1
+STATUS:CONFIRMED
+ORGANIZER:mailto:jake@hardincountyfair.org
 DTSTART;TZID=America/New_York:20270906T180000
 DTEND;TZID=America/New_York:20270906T210000
 RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=4
@@ -209,6 +211,8 @@ SUMMARY:Unlock: Event Center\\, Main Gate
 END:VEVENT
 BEGIN:VEVENT
 UID:a1
+STATUS:CONFIRMED
+ORGANIZER:mailto:jake@hardincountyfair.org
 RECURRENCE-ID;TZID=America/New_York:20270913T180000
 DTSTART;TZID=America/New_York:20270913T190000
 DTEND;TZID=America/New_York:20270913T200000
@@ -222,17 +226,22 @@ SUMMARY:Dentist
 END:VEVENT
 BEGIN:VEVENT
 UID:c3
+STATUS:CONFIRMED
+ORGANIZER:mailto:jake@hardincountyfair.org
 DTSTART;VALUE=DATE:20270911
 DTEND;VALUE=DATE:20270912
-SUMMARY:unlock: ALL
+SUMMARY:unlock: Office
 END:VEVENT
 END:VCALENDAR
 """
 
 
+ORGANIZERS = ["jake@hardincountyfair.org"]
+
+
 class CalendarTests(unittest.TestCase):
     def test_parse_and_expand(self):
-        cal = ical.Calendar({"ical_url": "x"}, TZ)
+        cal = ical.Calendar({"ical_url": "x", "allowed_organizers": ORGANIZERS}, TZ)
         cal.load_text(ICS)
         first = datetime(2027, 9, 1, tzinfo=TZ)
         wins = cal.windows(first, first + timedelta(days=30))
@@ -251,13 +260,19 @@ class CalendarTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            wins[0]["door_queries"]
-            in (["Event Center", "Main Gate"], ["*"], ["Event Center"]),
-            True,
+            sorted({w["door_text"] for w in wins}),
+            ["Event Center", "Event Center, Main Gate", "Office"],
         )
 
     def test_calendar_drives_unlock(self):
-        cal = ical.Calendar({"ical_url": "x", "buffer_before_min": 15}, TZ)
+        cal = ical.Calendar(
+            {
+                "ical_url": "x",
+                "buffer_before_min": 15,
+                "allowed_organizers": ORGANIZERS,
+            },
+            TZ,
+        )
         cal.load_text(ICS)
         mock, srv, eng = build(cal)
         try:

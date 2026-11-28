@@ -619,6 +619,8 @@ class GoogleTests(Base):
             "BIND": "127.0.0.1",
             "PORT": str(port),
             "ALLOWED_HOSTS": "127.0.0.1:%d" % port,
+            # 1.1.0 (AC42): plain http only to a local fake console, by explicit choice.
+            "DOORCONTROL_DEV_ALLOW_HTTP": "1",
         }
         with mock.patch.dict(os.environ, env):
             threading.Thread(target=app.main, args=([],), daemon=True).start()
@@ -832,7 +834,8 @@ class ActivityTests(Base):
         self.assertEqual(row["user"], "")
         Bot({"allowed_chat_ids": [42]}, st.eng).handle(42, "/lock main gate")
         row = st.log_rows()[0]
-        self.assertEqual((row["source"], row["user"]), ("telegram", ""))
+        # 1.1.0 (AC39): Telegram rows name the chat, never empty.
+        self.assertEqual((row["source"], row["user"]), ("telegram", "telegram:42/?"))
         api_rows = st.call("GET", "/api/log", cookie=st.session()).json()
         self.assertTrue(all("user" in r for r in api_rows))
 
@@ -918,10 +921,11 @@ class ActivityTests(Base):
         DB(path)  # opening again is a no-op
         cols = [r[1] for r in db.conn.execute("PRAGMA table_info(log)")]
         self.assertEqual(
-            cols, ["id", "ts", "door", "action", "source", "ok", "detail", "user"]
+            cols,
+            ["id", "ts", "door", "action", "source", "ok", "detail", "user", "kind"],
         )
         rows = [tuple(r) for r in db.conn.execute("SELECT * FROM log ORDER BY id")]
-        self.assertEqual(rows, [r + ("",) for r in old_rows])
+        self.assertEqual(rows, [r + ("", "door") for r in old_rows])
         self.assertEqual(db.get_schedule(5)["name"], "Office")
         self.assertEqual(db.get_state("d2")["applied"], "unlock")
         self.assertEqual(
@@ -944,11 +948,13 @@ class ActivityTests(Base):
             src = read("doorcontrol", name)
             self.assertNotRegex(src, r"\.client\.|set_lock_rule|\.unlock\(", name)
             self.assertIn("door_action(", src)
+        # 1.1.0 (AC28): no row-count cap any more; rows are pruned by age (see
+        # test_safety LogRetention).
         db = self.st.eng.db
         for i in range(1100):
             db.log("d", "lock", "web", True, str(i))
         n = db.conn.execute("SELECT COUNT(*) FROM log").fetchone()[0]
-        self.assertEqual(n, 1000)
+        self.assertEqual(n, 1100)
         self.assertEqual(db.recent_log(1)[0]["detail"], "1099")
 
 

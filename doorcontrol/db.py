@@ -26,12 +26,22 @@ CREATE TABLE IF NOT EXISTS log(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts REAL, door TEXT, action TEXT, source TEXT, ok INTEGER, detail TEXT
 );
+CREATE TABLE IF NOT EXISTS kv(
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 """
+
+# Log kinds (1.1.0). Rows are kept by age; sign-ins have their own cap so they never push
+# door actions out of the log.
+LOG_KINDS = ("door", "schedule", "signin", "system")
+SIGNIN_KEEP = 5000
 
 
 class DB:
     def __init__(self, path):
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        # timeout: manage.py (backup) and the app may touch the file at the same time.
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=10)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         with self.lock:
@@ -39,13 +49,32 @@ class DB:
             self._migrate()
             self.conn.commit()
 
+    def _columns(self, table):
+        return {r[1] for r in self.conn.execute("PRAGMA table_info(%s)" % table)}
+
     def _migrate(self):
         """Additive only: never recreate a table or change existing rows."""
-        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(log)")}
+        cols = self._columns("log")
         if "user" not in cols:
-            # Who did it (signed-in email or admin account); empty for scheduler/Telegram rows.
+            # Who did it (signed-in email or admin account); empty for scheduler rows.
             self.conn.execute(
                 "ALTER TABLE log ADD COLUMN \"user\" TEXT NOT NULL DEFAULT ''"
+            )
+        if "kind" not in cols:
+            # 1.1.0: door / schedule / signin / system (pruning by kind and age).
+            self.conn.execute(
+                "ALTER TABLE log ADD COLUMN kind TEXT NOT NULL DEFAULT 'door'"
+            )
+        cols = self._columns("door_state")
+        # 1.1.0: which kind of window holds the door, when it ends (UTC epoch), and
+        # whether a change by hand was already reported for this window.
+        if "source" not in cols:
+            self.conn.execute("ALTER TABLE door_state ADD COLUMN source TEXT")
+        if "ends_at" not in cols:
+            self.conn.execute("ALTER TABLE door_state ADD COLUMN ends_at REAL")
+        if "hand_alerted" not in cols:
+            self.conn.execute(
+                "ALTER TABLE door_state ADD COLUMN hand_alerted INTEGER NOT NULL DEFAULT 0"
             )
 
     # ---- schedules ----
@@ -120,24 +149,88 @@ class DB:
             ).fetchone()
         return dict(r) if r else None
 
-    def set_state(self, door_id, applied, end_action=None, reason=None):
+    def set_state(
+        self,
+        door_id,
+        applied,
+        end_action=None,
+        reason=None,
+        since=None,
+        source=None,
+        ends_at=None,
+    ):
         with self.lock:
             self.conn.execute(
-                "INSERT OR REPLACE INTO door_state(door_id,applied,end_action,since,reason) VALUES(?,?,?,?,?)",
-                (door_id, applied, end_action, time.time(), reason),
+                "INSERT OR REPLACE INTO door_state"
+                "(door_id,applied,end_action,since,reason,source,ends_at,hand_alerted) "
+                "VALUES(?,?,?,?,?,?,?,0)",
+                (
+                    door_id,
+                    applied,
+                    end_action,
+                    time.time() if since is None else since,
+                    reason,
+                    source,
+                    ends_at,
+                ),
+            )
+            self.conn.commit()
+
+    def update_state(self, door_id, **cols):
+        allowed = {"source", "ends_at", "hand_alerted"}
+        if not cols or set(cols) - allowed:
+            raise ValueError("update_state: unknown column")
+        names = sorted(cols)
+        with self.lock:
+            self.conn.execute(
+                "UPDATE door_state SET %s WHERE door_id=?"
+                % ",".join("%s=?" % n for n in names),
+                [cols[n] for n in names] + [door_id],
+            )
+            self.conn.commit()
+
+    # ---- small key/value store (Telegram update offset) ----
+    def kv_get(self, key, default=None):
+        with self.lock:
+            r = self.conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+        return r[0] if r else default
+
+    def kv_set(self, key, value):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)", (key, str(value))
             )
             self.conn.commit()
 
     # ---- activity log ----
-    def log(self, door, action, source, ok, detail="", user=""):
+    def log(self, door, action, source, ok, detail="", user="", kind="door"):
         with self.lock:
             self.conn.execute(
-                'INSERT INTO log(ts,door,action,source,ok,detail,"user") '
-                "VALUES(?,?,?,?,?,?,?)",
-                (time.time(), door, action, source, 1 if ok else 0, detail, user or ""),
+                'INSERT INTO log(ts,door,action,source,ok,detail,"user",kind) '
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    time.time(),
+                    door,
+                    action,
+                    source,
+                    1 if ok else 0,
+                    detail,
+                    user or "",
+                    kind if kind in LOG_KINDS else "door",
+                ),
             )
+            self.conn.commit()
+
+    def prune(self, days=90, signin_keep=SIGNIN_KEEP, now=None):
+        """Rows older than `days` go; sign-in rows are also capped at the newest
+        `signin_keep`. Door actions are never pushed out by sign-ins."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.conn.execute("DELETE FROM log WHERE ts < ?", (now - days * 86400,))
             self.conn.execute(
-                "DELETE FROM log WHERE id <= (SELECT MAX(id) FROM log) - 1000"
+                "DELETE FROM log WHERE kind='signin' AND id NOT IN "
+                "(SELECT id FROM log WHERE kind='signin' ORDER BY id DESC LIMIT ?)",
+                (signin_keep,),
             )
             self.conn.commit()
 

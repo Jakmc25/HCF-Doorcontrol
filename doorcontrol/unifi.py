@@ -15,6 +15,12 @@ class UnifiError(Exception):
     pass
 
 
+class UnifiUnreachable(UnifiError):
+    """The console did not answer at all (down, timeout, network). The scheduler skips the
+    rest of that tick's UniFi calls so a dead console cannot stretch one tick for minutes.
+    """
+
+
 class CertificateMismatch(OSError):
     pass
 
@@ -113,7 +119,7 @@ class UnifiClient:
                     "The UniFi console's certificate does not match unifi.cert_sha256, "
                     "so Door Control did not connect."
                 )
-            raise UnifiError("Cannot reach the UniFi door controller.")
+            raise UnifiUnreachable("Cannot reach the UniFi door controller.")
         try:
             payload = json.loads(raw or b"{}")
         except ValueError:
