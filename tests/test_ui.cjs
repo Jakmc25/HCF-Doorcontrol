@@ -270,6 +270,46 @@ test("By shows user, else source", async () => {
   ]);
 });
 
+function health(state) {
+  return {
+    "GET /api/health": {
+      status: 200,
+      body: { calendar_state: state, scheduler_ok: true },
+    },
+  };
+}
+
+test("calendar stale notice shows, escaped as text", async () => {
+  const { $ } = load("app.js", dashboardResponses(health("stale")));
+  await settle();
+  assert.strictEqual($("calnotice").hidden, false);
+  assert.match($("calnotice").textContent, /^Calendar stale/);
+  assert.match($("calnotice").textContent, /paused/);
+  assert.strictEqual($("calnotice").innerHTML, "", "set as text, not HTML");
+});
+
+test("calendar not read yet notice; ok, off and errors hide it", async () => {
+  let { $ } = load("app.js", dashboardResponses(health("unknown")));
+  await settle();
+  assert.strictEqual($("calnotice").hidden, false);
+  assert.match($("calnotice").textContent, /not read yet/);
+  for (const state of ["ok", "off"]) {
+    ({ $ } = load("app.js", dashboardResponses(health(state))));
+    $("calnotice").hidden = true; // as in index.html
+    await settle();
+    assert.strictEqual($("calnotice").hidden, true, state);
+  }
+  const r = load(
+    "app.js",
+    dashboardResponses({ "GET /api/health": { status: 500, body: {} } }),
+  );
+  await settle();
+  assert.strictEqual(r.$("calnotice").hidden, true);
+  assert.strictEqual(r.$("toast").textContent, "", "no error toast");
+  const html = fs.readFileSync(path.join(STATIC, "index.html"), "utf8");
+  assert.match(html, /<div[^>]*id="calnotice"[^>]*hidden/);
+});
+
 function loginInfo(info) {
   return { "GET /api/login-info": { status: 200, body: info } };
 }
