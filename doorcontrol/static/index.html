@@ -79,6 +79,40 @@
 
       <h2>Recent activity</h2>
       <div id="log"></div>
+
+      <section id="people-section" hidden>
+        <h2>Settings › People</h2>
+        <p class="sub"
+          >People on this list can sign in with Google and use the dashboard.
+          Admins are set in .env on the server and can't be removed here.</p
+        >
+        <div id="people"></div>
+        <div class="card spaced">
+          <form id="people-form">
+            <label for="people-email">Add someone</label
+            ><input
+              type="email"
+              id="people-email"
+              placeholder="name@hardincountyfair.org"
+              maxlength="254"
+              required
+            /><button class="primary" type="submit">Add</button>
+          </form>
+        </div>
+        <div id="people-confirm" class="card spaced" hidden>
+          <p id="people-confirm-text"></p>
+          <input
+            type="text"
+            id="people-confirm-input"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <button type="button" id="people-confirm-btn" class="danger" disabled
+            >Remove</button
+          >
+          <button type="button" id="people-confirm-cancel">Cancel</button>
+        </div>
+      </section>
     </main>
     <div id="toast" class="toast"></div>
     <script src="/static/app.js"></script>

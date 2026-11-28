@@ -288,16 +288,98 @@ async function loadHealth() {
 async function refreshAll() {
   await loadDoors();
   await Promise.all(
-    [loadSchedules(), loadUpcoming(), loadLog(), loadHealth()].map((p) =>
-      p.catch((e) => toast(e.message, true)),
-    ),
+    [
+      loadSchedules(),
+      loadUpcoming(),
+      loadLog(),
+      loadHealth(),
+      loadPeople(),
+    ].map((p) => p.catch((e) => toast(e.message, true))),
   );
 }
+// Settings › People: only admins get the section; it is never loaded for anyone else
+// (the server refuses them too).
+let isAdmin = false,
+  removing = "";
+async function loadPeople() {
+  if (!isAdmin) return;
+  const p = await api("GET", "/api/people");
+  const admins = p.admins.map(
+    (e) =>
+      `<tr><td>${esc(e)}</td><td><span class="pill">admin</span></td><td class="muted">change in .env</td><td></td></tr>`,
+  );
+  const listed = p.people.map(
+    (x) =>
+      `<tr><td>${esc(x.email)}</td><td>person</td><td class="muted">${esc(x.added_by ? "added by " + x.added_by : "")}</td><td><button class="danger" data-remove="${esc(x.email)}">Remove</button></td></tr>`,
+  );
+  $("people").innerHTML =
+    `<table><tr><th>Email</th><th>Role</th><th></th><th></th></tr>` +
+    admins.concat(listed).join("") +
+    "</table>" +
+    (p.people.length
+      ? ""
+      : '<div class="card muted">Nobody else yet. Add people below.</div>');
+}
+function closeRemove() {
+  removing = "";
+  $("people-confirm").hidden = true;
+  $("people-confirm-input").value = "";
+  $("people-confirm-btn").disabled = true;
+}
+$("people").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button");
+  if (!b || !b.dataset.remove) return;
+  removing = b.dataset.remove;
+  $("people-confirm-text").textContent =
+    "To remove " +
+    removing +
+    " and sign them out now, type their email address again:";
+  $("people-confirm-input").value = "";
+  $("people-confirm-btn").disabled = true;
+  $("people-confirm").hidden = false;
+  $("people-confirm-input").focus();
+});
+$("people-confirm-input").addEventListener("input", () => {
+  $("people-confirm-btn").disabled =
+    !removing ||
+    $("people-confirm-input").value.trim().toLowerCase() !== removing;
+});
+$("people-confirm-cancel").addEventListener("click", closeRemove);
+$("people-confirm-btn").addEventListener("click", async () => {
+  if (!removing) return;
+  try {
+    await api("POST", "/api/people/remove", {
+      email: removing,
+      confirm: $("people-confirm-input").value,
+    });
+    toast(removing + " removed and signed out");
+    closeRemove();
+    await Promise.all([loadPeople(), loadLog()]);
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+$("people-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    const r = await api("POST", "/api/people", {
+      email: $("people-email").value,
+    });
+    toast(r.email + " added");
+    $("people-email").value = "";
+    await Promise.all([loadPeople(), loadLog()]);
+  } catch (e) {
+    toast(e.message, true);
+  }
+});
+
 async function bootstrap() {
   const b = await api("GET", "/api/bootstrap");
   csrf = b.csrf;
   $("user").textContent = b.user || "";
   $("signout").hidden = false;
+  isAdmin = b.admin === true;
+  $("people-section").hidden = !isAdmin;
 }
 $("signout").addEventListener("click", async () => {
   try {

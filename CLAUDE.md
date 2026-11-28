@@ -6,7 +6,8 @@ one-time schedules, Google Calendar events ("Unlock: Event Center") that unlock 
 bot. It uses UniFi's temporary lock rules (`keep_unlock`, `reset`, `keep_lock`, `lock_now`, `custom`)
 through the local Access Open API (`https://<console>:12445`, bearer token). It never edits UniFi's own
 schedules or policies. Every error, schedule change and door status change is also sent as a Telegram
-alert (never delaying door control). Current version: **1.1.0**.
+alert (never delaying door control). Sign-in: Google for the admins in `GOOGLE_ALLOWED_EMAILS` and the
+in-app People list (admins manage it), server-side 12-hour sessions. Current version: **1.2.0**.
 
 ## Stack
 Language/runtime: Python 3.13 (Docker `python:3.13-slim-bookworm` + `tzdata`), standard library only
@@ -14,11 +15,12 @@ Language/runtime: Python 3.13 (Docker `python:3.13-slim-bookworm` + `tzdata`), s
 Key libraries: none.
 Layout: `doorcontrol/` (engine.py = scheduler, tick lock, watchdog, door matching, schedule changes;
 unifi.py = API client; ical.py = calendar reader, acceptance rules, repeat rules, DST helpers; notify.py
-= Telegram alert queue and sender thread; people.py = admin emails / calendar organizers; backup.py =
-daily backups; web.py = dashboard, sign-in gate, CSRF and API; telegram_bot.py; db.py; app.py = startup
+= Telegram alert queue and sender thread; people.py = admin emails, People list helpers, email check,
+calendar organizers; backup.py = daily backups; web.py = dashboard, sign-in gate, server-side
+`Sessions`, `DoorGoogle`, People routes, CSRF and API; telegram_bot.py; db.py; app.py = startup
 checks and wiring; google_signin.py + auth.py = shared sign-in modules copied from Awards; static/ =
 index.html, app.js, style.css, login.html, login.js, fair-logo.png), `manage.py` (break-glass admin
-accounts, `backup`), `mock_unifi.py` (fake controller for tests: `fail`, `fail_paths`, `hang`,
+accounts, `backup`, `sessions`, `revoke`), `mock_unifi.py` (fake controller for tests: `fail`, `fail_paths`, `hang`,
 `set_by_hand`), `run.py`, `VERSION`.
 
 ## Commands
@@ -64,6 +66,14 @@ docker run --rm -v "$PWD":/w -w /w node:22-alpine npx --yes prettier@3 --check "
   window times in UTC only (`ical.wall_to_utc`, `gap_end`); only one tick at a time (`Engine.tick` /
   `request_tick`). A calendar problem must never stop schedules.
 - Schema changes are additive (see `DB._migrate`).
+- Sessions (1.2.0): only `web.Sessions` makes them (cookie `__Host-doors_sid`, 12 h, `SESSION_HOURS`);
+  the database keeps only `sha256(id)`. Every request re-checks the person (Google: admin, People list
+  or allowed domain; break-glass: same account `gen`). Never use the shared modules' stateless
+  `issue/verify/cookie_header` again.
+- People list (1.2.0): admins = Google sessions whose email is in `GOOGLE_ALLOWED_EMAILS`; the
+  break-glass `admin:NAME` is not an admin for it. People routes call `require_admin()`; add/remove is
+  logged (kind `people`) and alerted (kind `people`); removal deletes that person's sessions in the
+  same transaction (`DB.person_remove`).
 
 ## Shared code
 `doorcontrol/google_signin.py` and `doorcontrol/auth.py` are unchanged copies from Awards
@@ -75,7 +85,11 @@ docker run --rm -v "$PWD":/w -w /w node:22-alpine npx --yes prettier@3 --check "
 Never patch them here: copy a newer Awards version and bump both hashes (test and this list).
 Budget and Thank You copies were not yet compared with Awards. App-specific rules live in `web.py`
 (stricter than Awards: always-Secure cookies, no "open until configured", CSRF on logout,
-loopback-only `/health`, every Google refusal logged) and `manage.py` (12-character minimum).
+loopback-only `/health`, every Google refusal logged, server-side sessions) and `manage.py`
+(12-character minimum). `web.DoorGoogle` subclasses `google_signin.Google` without editing it: the
+`emails` property's setter keeps the env admins, its getter adds the People list, so the parent's
+`finish()`, `ready()`, `start()` and `allowed()` work unchanged.
+`WhoSignsInTests.test_door_google_relies_on_parent_behaviour` pins what the subclass relies on.
 `login.html`, `login.js` and `fair-logo.png` are adapted copies of Awards' files.
 
 ## Where it runs
@@ -90,7 +104,8 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   If the internet or tunnel is down: no dashboard; scheduler and Telegram keep running; use the UniFi
   Access app.
 - `.env` (next to compose.yaml, mode 600): `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
-  `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (empty),
+  `GOOGLE_ALLOWED_DOMAINS=` (empty since 1.2.0: no domain-wide access),
+  `GOOGLE_ALLOWED_EMAILS=jake@hardincountyfair.org,kolt@hardincountyfair.org` (the admins),
   `PUBLIC_HOSTS=doors.jakemc.me`,
   `ALLOWED_HOSTS=192.168.1.160:8480,fair-server:8480,localhost:8480,127.0.0.1:8480` (empty = refuse every
   fair-network address), optional `TRUSTED_PROXIES` (default `172.31.248.1/32`, the gateway of the app's
@@ -119,6 +134,36 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   together (both drive the doors and poll the bot).
 - Break-glass account: `docker compose exec app python manage.py set-password admin` (as the app user,
   never root).
+
+### Upgrade to 1.2.0 (one time, before the Deploy block)
+1.2.0 lets only the admins in `GOOGLE_ALLOWED_EMAILS` and the in-app People list sign in. This block
+saves the current `.env` to `/srv/fair-apps/door-control-backups/env-<time>` (mode 600), keeps every
+other line, sets `GOOGLE_ALLOWED_DOMAINS=` (empty) and
+`GOOGLE_ALLOWED_EMAILS=jake@hardincountyfair.org,kolt@hardincountyfair.org`, and writes `.env` with
+mode 600. Nothing to edit by hand. It changes nothing in the running app until the Deploy block
+recreates the container:
+```bash
+(set -e
+cd /srv/fair-apps/door-control
+test -f .env || { echo "Stop: no .env here. Nothing changed."; exit 1; }
+umask 077
+mkdir -p -m 700 /srv/fair-apps/door-control-backups
+ENVBK=/srv/fair-apps/door-control-backups/env-$(date +%Y%m%d-%H%M%S)
+cp -p .env "$ENVBK"
+chmod 600 "$ENVBK"
+{ grep -v -e '^GOOGLE_ALLOWED_DOMAINS=' -e '^GOOGLE_ALLOWED_EMAILS=' .env || true; } > .env.new
+grep -q '^GOOGLE_CLIENT_ID=' .env.new || { rm -f .env.new; echo "Stop: .env has no GOOGLE_CLIENT_ID line. Nothing changed."; exit 1; }
+printf '%s\n' 'GOOGLE_ALLOWED_DOMAINS=' 'GOOGLE_ALLOWED_EMAILS=jake@hardincountyfair.org,kolt@hardincountyfair.org' >> .env.new
+chmod 600 .env.new
+mv .env.new .env
+ls -l .env
+grep '^GOOGLE_ALLOWED_' .env
+echo "Old .env saved as $ENVBK. Now run the Deploy block below.")
+```
+Then run the Deploy block. After it, **everyone signs in again once** (Jake, Kolt and the break-glass
+account): the old 14-day cookies stop working. Jake then adds other staff in Settings › People (bottom
+of the dashboard). To undo the `.env` change, copy the saved `env-<time>` file back to `.env` and run
+`docker compose up -d`.
 
 ### Deploy
 In order: checks Docker >= 28 and that the old systemd service is not running (if the app is not
@@ -179,9 +224,13 @@ for P in deploy pre-rollback; do ls -1d "$BKROOT/$P"-* 2>/dev/null | sort | head
 docker compose ps
 echo "Deployed $(cat VERSION). Backup in $BK")
 ```
-Calendar (only if one is set up): 1.1.0 opens doors only for events from `calendar.allowed_organizers` (or, if that key is missing, `GOOGLE_ALLOWED_EMAILS`, empty on fair-server today). With neither set, every "Unlock:" event is refused with a Telegram alert, nothing more. Today no calendar feed is configured, so nothing changes; when one is added, set `allowed_organizers` (README "Calendar").
+Calendar (only if one is set up): opens doors only for events from `calendar.allowed_organizers` (or, if that key is missing, the admins in `GOOGLE_ALLOWED_EMAILS` plus the People list, since 1.2.0). With neither set, every "Unlock:" event is refused with a Telegram alert, nothing more. Today no calendar feed is configured, so nothing changes; when one is added, set `allowed_organizers` (README "Calendar").
 After it: send the Telegram bot `/doors`; the next door change sends an alert to the allowed private
 chats. Check `docker compose exec app python manage.py backup` prints a path.
+Manual checks for 1.2.0: Jake signs in with Google and sees Settings › People; a hardincountyfair.org
+account that is not on the list is refused (and shows in Recent activity); add a test person, sign in
+as them (no People section), remove them with the typed confirmation and check they are signed out at
+once and a Telegram alert arrived; `docker compose exec app python manage.py sessions` lists sessions.
 
 ### Rollback to the previous Docker version (1.1.0 and later)
 Goes back to the commit and data of one `deploy-<time>` folder made by the deploy block (the typed
@@ -384,6 +433,15 @@ dev-standards PR after 1.1.0 deploys.
   break-glass admin password, CSRF, host lockdown, who-did-it activity log (additive `log.user`),
   Docker Compose, CSP + static split, black/prettier, VERSION/CHANGELOG. Review round 1: trusted
   proxies (round 2: own network door-control-net, gateway /32 only; round 3: port on 127.0.0.1 only), overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
+- 1.2.0 (2026-11-28, feature/people-sessions, PR 2 of the plan in docs/features/safety-alerts, AC40,
+  AC41, AC41a): server-side sessions (only sha256 of the id stored, 12 h, cookie `__Host-doors_sid`,
+  re-checked at each request, logout deletes the row, `manage.py sessions`/`revoke`, set-password and
+  remove-user end that account's sessions; old `doors_auth` cookies refused and cleared); Google only
+  for admins (`GOOGLE_ALLOWED_EMAILS`) and the in-app People list (`web.DoorGoogle`, shared modules
+  unchanged), refusals logged; Settings › People for admins (add with email check, remove with typed
+  confirmation, admins not removable, removal signs out at once, logged + Telegram alert); calendar
+  organizers default to admins + People. Additive tables `sessions`, `people`; log kind `people`.
+  `.env` values change (one-time block above); no new `.env` variables; everyone signs in again once.
 - 1.1.0 (2026-11-28, feature/safety-alerts, PR 1 of the plan in docs/features/safety-alerts; audit
   docs/audits/2026-11-27.md): calendar safety (status, organizer allowlist, invitations, no ALL, exact
   matching, validated/bounded RRULEs with nth/last weekday, EXDATE by day, feed checks, unknown/stale,

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.0 (2026-11-28)
+Who can sign in, and sessions that can be ended.
+- **Sessions on the server.** A sign-in (Google or break-glass) lasts 12 hours. The database keeps only
+  a hash of each session; every request checks the person is still allowed. Sign out ends the session;
+  `manage.py sessions` lists them and `manage.py revoke EMAIL|admin:NAME|--all` ends them at once. A
+  new break-glass password or removing that account also ends its sessions. Old 14-day cookies no
+  longer work: **everyone signs in again once** after the upgrade.
+- **Who may sign in.** Only the admins in `GOOGLE_ALLOWED_EMAILS` and the people an admin added in
+  the app. Other accounts, including other hardincountyfair.org accounts, are refused and the refusal
+  is written to Recent activity. `GOOGLE_ALLOWED_DOMAINS` is now empty on fair-server.
+- **Settings › People** (admins only, bottom of the dashboard): add an email (format checked, any
+  case, no duplicates) or remove one by typing the email again. Removing someone signs them out at
+  once. Admins can only be changed in `.env`. Every add and remove is logged with who did it and sent
+  as a Telegram alert. The break-glass account cannot change the list.
+- **Calendar organizers** now default to the admins plus the People list.
+- Upgrade: run the one-time `.env` block in CLAUDE.md ("Upgrade to 1.2.0"), then the Deploy block.
+  Additive database tables `sessions` and `people`; no new `.env` variables.
+
 ## 1.1.0 (2026-11-28)
 Safety fixes from the 2026-11-27 audit, and Telegram alerts.
 - **Calendar safety.** A calendar event opens doors only if it is CONFIRMED, its organizer is allowed

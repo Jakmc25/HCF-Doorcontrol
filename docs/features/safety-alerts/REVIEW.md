@@ -44,3 +44,18 @@ Sent to developer: R1, Q1, S11, S12, R2, R3, R4/Q5 (docs), R5, S13, S14, S15, S1
 ## Re-check (after 7d4bc71): PASS
 Code reviewer (opus) verified R1, Q1, S11, S12 and R2 fixed, with no new findings, and accepted the three deviations: (a) the chain cap fails closed and is alerted; (b) the calendar-open alert is low priority, but the action is still logged; (c) unclear reads alert after `failures_before_alert`. No BLOCKER or SHOULD-FIX open.
 Release check: NO-GO only on (1) this missing sign-off and (2) the undocumented calendar organizer setup. Both are fixed in docs: the CLAUDE.md deploy notes cover the calendar organizer, and test_qa.py was added to the test commands. No calendar feed is configured on fair-server today, so behavior there is unchanged.
+
+# PR 2 (1.2.0, branch feature/people-sessions)
+
+## Round 1 (2026-11-28)
+Security: PASS. Code review: PASS. QA: PASS (236 tests, every AC tested; 1.1.0 → 1.2.0 database upgrade checked). No BLOCKER or SHOULD-FIX.
+
+### NIT
+- **S1**, people.py:13: non-ASCII characters (zero-width, RTL override) are allowed before the @. Refuse addresses that are not ASCII.
+- **S2**, web.py:412, 737: the CSRF token isn't tied to the session and its cookie has no `__Host-` prefix. Rename it to `__Host-doors_csrf` and sign the session id hash into the token.
+- **S3**, web.py:690, 731: a new sign-in leaves the browser's old session row valid. Delete it on sign-in.
+- **R1**, web.py:207: the `load_secret` docstring is out of date (the file now only signs CSRF tokens; to sign everyone out use `manage.py revoke --all`).
+- **R2** (code review note): refused Google sign-ins log `str(e)` to the activity log, which every signed-in person can read. Make sure no outsider's email address lands there (keep it in the server log only, or mask it).
+
+## Fix round 1
+Sent to developer: S1, S2, S3, R1, R2 (NITs, cheap). Per the workflow, NIT fixes are not re-reviewed; the full suite must pass.

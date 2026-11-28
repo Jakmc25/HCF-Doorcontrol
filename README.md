@@ -1,4 +1,4 @@
-# Fairgrounds Door Control 1.1.0
+# Fairgrounds Door Control 1.2.0
 
 A friendly front end for UniFi Access: one-tap lock/unlock, repeating and one-time schedules,
 Google Calendar-driven unlocks, and a Telegram bot. Python standard library only, runs in Docker
@@ -13,20 +13,46 @@ Telegram alert. A door changed by hand in UniFi is never touched again for that 
 
 ## Signing in
 
-Open **https://doors.jakemc.me** from anywhere and press **Sign in with Google**. Any verified
-`@hardincountyfair.org` Google account can view and control every door and schedule. Personal
-accounts (gmail.com and others) are refused. Your email shows at the top right, next to **Sign out**.
+Open **https://doors.jakemc.me** from anywhere and press **Sign in with Google**. Only these
+Google accounts can sign in (since 1.2.0):
+
+- **Admins:** the emails in `GOOGLE_ALLOWED_EMAILS` in `.env` on fair-server (Jake and Kolt). They
+  can also manage **Settings › People** at the bottom of the dashboard. Admins are changed only in
+  `.env` (then restart); the app can't add or remove them.
+- **People:** the emails an admin added in Settings › People. They can view and control every door
+  and schedule, but can't see or change the People list.
+
+Every other account is refused and the refusal is written to Recent activity, including other
+`@hardincountyfair.org` accounts (`GOOGLE_ALLOWED_DOMAINS` stays empty) and personal accounts. Your
+email shows at the top right, next to **Sign out**.
+
+**Settings › People** (admins only): type an email and press **Add**. To remove someone press
+**Remove** and type their email again; the button only works when it matches. Removing someone signs
+them out at once. Every add and remove is written to Recent activity with who did it and sent as a
+Telegram alert. People on the list also count as calendar organizers (see "Google Calendar").
+The break-glass admin account (below) can use the dashboard but not the People list.
 
 - The dashboard is reachable only through **https://doors.jakemc.me** (or on fair-server itself).
   Nothing on the fair network can connect to it directly: the port is published on fair-server's
   loopback only, and sign-in needs HTTPS anyway. The scheduler and the Telegram bot are not affected.
-- A sign-in lasts 14 days (`SESSION_DAYS` in `doorcontrol/web.py`). **Sign out** clears it in that
-  browser only.
-- **Sign everyone out** (for example after a lost laptop): delete the session secret and restart.
-  Everyone, including admin sign-ins, has to sign in again:
+- A sign-in lasts 12 hours (`SESSION_HOURS` in `doorcontrol/web.py`). Sessions are kept on the
+  server (the database holds only a hash of each one), so they can be ended at any time. **Sign out**
+  ends that sign-in.
+- See who is signed in, or sign one person out at once (an email, or `admin:NAME` for the
+  break-glass account):
   ```bash
-  (cd /srv/fair-apps/door-control && docker compose exec app rm -f /data/session-secret && docker compose restart && docker compose ps)
+  (cd /srv/fair-apps/door-control && docker compose exec app python manage.py sessions)
   ```
+  ```bash
+  (cd /srv/fair-apps/door-control && docker compose exec app python manage.py revoke someone@hardincountyfair.org)
+  ```
+- **Sign everyone out** (for example after a lost laptop). Everyone, including admin sign-ins, has
+  to sign in again:
+  ```bash
+  (cd /srv/fair-apps/door-control && docker compose exec app python manage.py revoke --all)
+  ```
+- Removing an admin from `GOOGLE_ALLOWED_EMAILS` and restarting refuses their sessions at the next
+  request. Setting a new break-glass password or removing that account ends its sessions too.
 - Every door action, schedule change and sign-in is written to **Recent activity** with the
   person's email. Scheduler rows show the schedule name, calendar rows `calendar:<organizer>`, Telegram
   rows `telegram:<chat id>/<name>`. Rows are kept for 90 days (`log_days` in config.json); sign-ins
@@ -51,17 +77,18 @@ unlock a door by hand.
 
 ## If you cannot sign in
 
-1. **Use the admin sign-in.** On the sign-in page at doors.jakemc.me, open **Admin sign-in** (small
+1. **"… isn't allowed to use this app":** ask Jake or Kolt to add your email in Settings › People.
+2. **Use the admin sign-in.** On the sign-in page at doors.jakemc.me, open **Admin sign-in** (small
    link under the Google button) and use the break-glass account. It only appears once an account
    exists (see below).
-2. **Check the Google settings** in `/srv/fair-apps/door-control/.env` (client ID and secret, see
+3. **Check the Google settings** in `/srv/fair-apps/door-control/.env` (client ID and secret, see
    "Google OAuth client" below), then restart:
    ```bash
    (cd /srv/fair-apps/door-control && docker compose up -d && docker compose logs --tail=30)
    ```
    The log says "Google sign-in is not set up" when the values are missing, and prints every refused
    sign-in with the reason.
-3. **Last resort:** the UniFi Access app. The scheduler and Telegram bot do not need anyone signed in.
+4. **Last resort:** the UniFi Access app. The scheduler and Telegram bot do not need anyone signed in.
 
 ### Break-glass admin account
 
@@ -100,16 +127,16 @@ at most 20 alerts a minute (the rest arrive as one summary). The limit counts al
 with 2 allowed chats that is up to 40 Telegram messages a minute (Jake's choice). Alerts never contain tokens or the
 calendar address. If the bot token or the chat list is empty, alerts are only written to the server
 log. Switch a kind off in `config.json` under `alerts.kinds` (`door_error`, `scheduler`, `calendar`,
-`backup`, `schedule_change`, `status`, `hand_change`, `recovered`; `people` is used from 1.2.0); the other `alerts` settings are
+`backup`, `schedule_change`, `status`, `hand_change`, `people`, `recovered`); the other `alerts` settings are
 `repeat_minutes`, `max_per_minute`, `queue_size` and `failures_before_alert`.
 
 ## Settings
 
 | Where | What |
 |---|---|
-| `.env` next to `compose.yaml` (git-ignored, mode 600) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org`, `GOOGLE_ALLOWED_EMAILS=` (leave empty), `PUBLIC_HOSTS=doors.jakemc.me`, `ALLOWED_HOSTS` (defense in depth: host names accepted for direct requests; the port is published on loopback only, so it matters only if the port is ever re-published on the fair network; empty refuses every other address), optional `TRUSTED_PROXIES` (see below). See `.env.example`. |
+| `.env` next to `compose.yaml` (git-ignored, mode 600) | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_ALLOWED_DOMAINS=` (leave empty), `GOOGLE_ALLOWED_EMAILS=` the admins (comma-separated), `PUBLIC_HOSTS=doors.jakemc.me`, `ALLOWED_HOSTS` (defense in depth: host names accepted for direct requests; the port is published on loopback only, so it matters only if the port is ever re-published on the fair network; empty refuses every other address), optional `TRUSTED_PROXIES` (see below). See `.env.example`. |
 | `/data/config.json` in the `door_control_data` volume (mode 600) | UniFi host (must be `https://`), API token and `cert_sha256` (required), Telegram bot token, allowed chat IDs and limits, Google Calendar secret iCal URL and calendar rules, `alerts`, time zone, default unlock minutes, `hand_check_minutes` (5), `log_days` (90). See `config.example.json`. |
-| `/data/doorcontrol.db`, `/data/session-secret`, `/data/accounts.json` | Schedules, door state and activity log; session signing key; break-glass account. |
+| `/data/doorcontrol.db`, `/data/session-secret`, `/data/accounts.json` | Schedules, door state, activity log, sign-in sessions (hashes only) and the People list; key for the CSRF tokens; break-glass account. |
 | `/data/backups` | Daily backups (see "Backup and restore"). |
 
 ### Logs
@@ -126,7 +153,7 @@ seconds or the scheduler stopped. Docker then shows the container as **unhealthy
 "Scheduler stalled" is sent once (and "running again" when it recovers).
 
 Changing `GOOGLE_ALLOWED_DOMAINS` or `GOOGLE_ALLOWED_EMAILS` and restarting signs out every Google
-session made under the old rule.
+session that the new rule no longer allows (checked at each request).
 
 ### Trusted proxies (TRUSTED_PROXIES in .env)
 
@@ -331,8 +358,8 @@ umask 077
 cat > .env <<EOF
 GOOGLE_CLIENT_ID=$GID
 GOOGLE_CLIENT_SECRET=$GSECRET
-GOOGLE_ALLOWED_DOMAINS=hardincountyfair.org
-GOOGLE_ALLOWED_EMAILS=
+GOOGLE_ALLOWED_DOMAINS=
+GOOGLE_ALLOWED_EMAILS=jake@hardincountyfair.org,kolt@hardincountyfair.org
 PUBLIC_HOSTS=doors.jakemc.me
 ALLOWED_HOSTS=192.168.1.160:8480,fair-server:8480,localhost:8480,127.0.0.1:8480
 EOF
@@ -369,9 +396,10 @@ purpose) and `calendar.calendar_email`. Then create events titled like:
 Rules (each refused event is written to the server log and sent as a Telegram alert):
 - Only events with status **confirmed** count; tentative and cancelled events never open a door.
 - The organizer must be in `calendar.allowed_organizers`. If that key is missing, the emails in
-  `GOOGLE_ALLOWED_EMAILS` count. **An empty list (`"allowed_organizers": []`) still counts as set**: it
-  means nobody, and the `GOOGLE_ALLOWED_EMAILS` fallback is not used. Leave the key out to use the admins.
-  If both are empty, no event opens a door (one alert at startup).
+  `GOOGLE_ALLOWED_EMAILS` (admins) plus everyone in Settings › People count (read at each calendar
+  refresh). **An empty list (`"allowed_organizers": []`) still counts as set**: it means nobody, and the
+  admins/People fallback is not used. Leave the key out to use the admins and People.
+  If all are empty, no event opens a door (one alert at startup).
   Google lists a secondary calendar itself as the organizer, so activity shows `calendar:<that address>`.
 - The organizer check only proves what the feed says. Google writes the organizer, but **the real
   control is who can add or edit events on that calendar**: anyone with "Make changes to events" on it
@@ -431,6 +459,11 @@ Cloudflare row (step 4) -> trusted-proxy checks -> manual checks.
 
 The first-move block uses `sudo` (to stop the old service), so it can stop at a **sudo password
 prompt** halfway. Run `sudo -v` right before pasting it, so sudo is already unlocked.
+
+### Upgrading to 1.2.0 (one time)
+Run the "Upgrade to 1.2.0" block in `CLAUDE.md` first (it backs up `.env`, then sets
+`GOOGLE_ALLOWED_DOMAINS=` empty and `GOOGLE_ALLOWED_EMAILS=jake@hardincountyfair.org,kolt@hardincountyfair.org`),
+then the normal Deploy block. Everyone signs in again once afterwards.
 
 ## Notes and limits
 - Lock rules need a UniFi Access hub that supports them (API v1.24.6+). `Lock now` uses `lock_now`.
