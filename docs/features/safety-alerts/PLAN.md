@@ -472,3 +472,6 @@ If Jake prefers one PR, everything above ships as 1.1.0 unchanged.
 7. Multi-day all-day events: **refused with an alert (one event per day)**.
 8. Hand-change check during our windows: **every 5 minutes**.
 9. The 20/minute cap counts alerts (one alert to all chats = 1): **yes**.
+
+## Approval (2026-11-28)
+Approved by Jake with all nine decision defaults, including the split: PR 1 = 1.1.0 (AC1-39, AC42-50), PR 2 = 1.2.0 (AC40, AC41, AC41a), built after PR 1.
