@@ -5,29 +5,35 @@ Friendly control panel for the fairgrounds' UniFi Access doors: one-tap lock/unl
 one-time schedules, Google Calendar events ("Unlock: Event Center") that unlock doors, and a Telegram
 bot. It uses UniFi's temporary lock rules (`keep_unlock`, `reset`, `keep_lock`, `lock_now`, `custom`)
 through the local Access Open API (`https://<console>:12445`, bearer token). It never edits UniFi's own
-schedules or policies. Current version: **1.0.0**.
+schedules or policies. Every error, schedule change and door status change is also sent as a Telegram
+alert (never delaying door control). Current version: **1.1.0**.
 
 ## Stack
 Language/runtime: Python 3.13 (Docker `python:3.13-slim-bookworm` + `tzdata`), standard library only
 (http.server, sqlite3, urllib); plain JS front end, no build step.
 Key libraries: none.
-Layout: `doorcontrol/` (engine.py = scheduler, unifi.py = API client, ical.py = calendar, web.py =
-dashboard, sign-in gate, CSRF and API, telegram_bot.py, db.py, google_signin.py + auth.py = shared
-sign-in modules copied from Awards, static/ = index.html, app.js, style.css, login.html, login.js,
-fair-logo.png), `manage.py` (break-glass admin accounts), `mock_unifi.py` (fake controller for tests),
-`run.py`, `VERSION`.
+Layout: `doorcontrol/` (engine.py = scheduler, tick lock, watchdog, door matching, schedule changes;
+unifi.py = API client; ical.py = calendar reader, acceptance rules, repeat rules, DST helpers; notify.py
+= Telegram alert queue and sender thread; people.py = admin emails / calendar organizers; backup.py =
+daily backups; web.py = dashboard, sign-in gate, CSRF and API; telegram_bot.py; db.py; app.py = startup
+checks and wiring; google_signin.py + auth.py = shared sign-in modules copied from Awards; static/ =
+index.html, app.js, style.css, login.html, login.js, fair-logo.png), `manage.py` (break-glass admin
+accounts, `backup`), `mock_unifi.py` (fake controller for tests: `fail`, `fail_paths`, `hang`,
+`set_by_hand`), `run.py`, `VERSION`.
 
 ## Commands
 Run locally against the fake controller: `python3 mock_unifi.py 12445`, then
-`PUBLIC_HOSTS=localhost:8480 ALLOWED_HOSTS=localhost:8480 TRUSTED_PROXIES=127.0.0.1/32 python3 run.py config.json`
+`DOORCONTROL_DEV_ALLOW_HTTP=1 PUBLIC_HOSTS=localhost:8480 ALLOWED_HOSTS=localhost:8480 TRUSTED_PROXIES=127.0.0.1/32 python3 run.py config.json`
 (config: unifi.host `http://127.0.0.1:12445`, token `test-token`; data in `data/`; sign in with a local
-`python3 manage.py set-password admin`).
+`python3 manage.py set-password admin`). `DOORCONTROL_DEV_ALLOW_HTTP=1` allows plain http only to
+127.0.0.1/localhost; without it the app refuses any console that is not https and pinned/verified.
 Run tests (Docker, as on fair-server):
 ```bash
-docker run --rm -v "$PWD":/app -w /app python:3.13-slim-bookworm sh -c 'apt-get -qq update && apt-get -qq install -y tzdata >/dev/null && python tests/test_all.py && python tests/test_google.py'
+docker run --rm -v "$PWD":/app -w /app python:3.13-slim-bookworm sh -c 'apt-get -qq update && apt-get -qq install -y tzdata openssl >/dev/null && python tests/test_all.py && python tests/test_google.py && python tests/test_safety.py && python tests/test_alerts.py'
 docker run --rm -v "$PWD":/w -w /w node:22-alpine node tests/test_ui.cjs
 ```
-Without Docker: `python3 tests/test_all.py && python3 tests/test_google.py && node tests/test_ui.cjs`.
+Without Docker: `python3 tests/test_all.py && python3 tests/test_google.py && python3 tests/test_safety.py && python3 tests/test_alerts.py && node tests/test_ui.cjs`.
+Tests use only `mock_unifi.py`, a fake Telegram (`tests/support.py` `Recorder`) and fake clocks.
 Lint:
 ```bash
 docker run --rm -v "$PWD":/w -w /w python:3.13-slim-bookworm sh -c 'pip install -q black && black --check .'
@@ -46,9 +52,17 @@ docker run --rm -v "$PWD":/w -w /w node:22-alpine npx --yes prettier@3 --check "
 - Every route goes in `web.ROUTES` (needs a session; non-GET also needs the CSRF token). Only the sign-in
   page, `LOGIN_STATIC`, `SIGNIN_ROUTES` and loopback `/health` are open.
 - Never commit `.env`, `config.json` (UniFi/Telegram tokens, calendar URL) or `data/`.
-- Door actions must go through `Engine.door_action` (pass `user=` from the web) so they are logged.
-- `engine.py`, `telegram_bot.py`, `ical.py`, `unifi.py`, `db.py` never import `web`, `auth` or
-  `google_signin`: the scheduler and bot must keep working with nobody signed in.
+- Door actions must go through `Engine.door_action` (pass `user=` from the web) so they are logged and
+  alerted. Schedule changes go through `Engine.add_schedule/update_schedule/delete_schedule(..., user=)`.
+- `engine.py`, `telegram_bot.py`, `ical.py`, `unifi.py`, `db.py`, `notify.py`, `people.py`, `backup.py`
+  never import `web`, `auth` or `google_signin`: the scheduler, bot, alerts and backups must keep working
+  with nobody signed in.
+- Alerts only through `Notifier.alert(kind, text, key)` (or `outage`/`recovered`): O(1), no I/O, never
+  raises; a separate thread sends. Never call Telegram from the scheduler, calendar or web path. Alert
+  texts are fixed templates; never put tokens or the calendar URL in them (`scrub` is the backstop).
+- Fail safe: on doubt keep the current state, log and alert; never touch a door changed by hand; compare
+  window times in UTC only (`ical.wall_to_utc`, `gap_end`); only one tick at a time (`Engine.tick` /
+  `request_tick`). A calendar problem must never stop schedules.
 - Schema changes are additive (see `DB._migrate`).
 
 ## Shared code
@@ -84,17 +98,18 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
   appears; only that peer may vouch for `CF-Connecting-IP` and the public Host, so other fair-app
   containers cannot; wrong value = public sign-in refused, never open; README "Trusted proxies" has the
   checks and what to do if the subnet clashes). README step 3 has the block that writes `.env`.
-- `config.json` may set `unifi.cert_sha256` (console certificate fingerprint; README "Pin the UniFi
-  console certificate"). Unset: not checked, one warning at startup.
-- Deploy (run by the person deploying, see People in .claude/standards/STANDARDS.md), after a PR merges:
-  ```bash
-  (set -e; cd /srv/fair-apps/door-control && git checkout main && git pull --ff-only && docker compose up -d --build && docker compose ps && sleep 20 && if docker compose logs --tail=100 | grep -q "cert_sha256 is not set"; then echo "Next: pin the UniFi certificate with the block in README, 'Pin the UniFi console certificate'."; fi)
-  ```
-  The deploy prints a reminder when the UniFi certificate is not pinned yet; then run the README block
-  "Pin the UniFi console certificate" (it reads the console address from config.json). Run it again
-  after the console's certificate is renewed.
+- `config.json` must set `unifi.cert_sha256` (console certificate fingerprint; README "Pin the UniFi
+  console certificate") unless `verify_tls` is true, and `unifi.host` must be https: since 1.1.0 the app
+  otherwise refuses to start and sends nothing. The deploy block below pins it when missing. Run the
+  README pin block again after the console's certificate is renewed.
+- Deploy (run by the person deploying, see People in .claude/standards/STANDARDS.md) after a PR merges:
+  the block in "Deploy" below (precondition: 1.0.0 or later already runs in Docker; if
+  cert_sha256 is not set it pins the certificate before the restart).
+- Daily backups: `/data/backups` inside the volume (14 kept, mode 600; README "Backup and restore").
+  Deploy and rollback backups: `/srv/fair-apps/door-control-backups` (folders `deploy-*`,
+  `pre-rollback-*`, mode 700).
 - Docker Engine on fair-server must be version 28 or newer (older versions could let other machines on
-  the same network reach ports published on 127.0.0.1). Check before every deploy:
+  the same network reach ports published on 127.0.0.1). The deploy block checks it; to check by hand:
   ```bash
   docker version --format '{{.Server.Version}}'
   ```
@@ -105,7 +120,127 @@ loopback-only `/health`, every Google refusal logged) and `manage.py` (12-charac
 - Break-glass account: `docker compose exec app python manage.py set-password admin` (as the app user,
   never root).
 
+### Deploy
+In order: checks Docker >= 28, that the old systemd service is not running and that the app runs;
+records the previous commit and backs up the database, config.json, accounts.json and session-secret
+to a new `deploy-<time>` folder (nothing has changed yet if any of this fails); pins the UniFi
+certificate if it is not pinned (before any restart, so the new version never refuses to start); pulls
+and builds while the old version keeps running; starts the new version and waits up to 90 s for
+healthy. Any failure after the start puts the previous commit (and its image) back and starts it.
+```bash
+(set -eE
+cd /srv/fair-apps/door-control
+V=$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)
+if ! [ "${V%%.*}" -ge 28 ] 2>/dev/null; then echo "Stop: Docker Engine ${V:-unknown} is older than 28 (or not reachable). Nothing changed. Tell Jake."; exit 1; fi
+if systemctl is-active --quiet door-control; then echo "Stop: the old systemd service is running; use the first-move block. Nothing changed."; exit 1; fi
+test -n "$(docker compose ps --status running -q app)" || { echo "Stop: Door Control is not running here. Nothing changed."; exit 1; }
+umask 077
+BKROOT=/srv/fair-apps/door-control-backups
+mkdir -p -m 700 "$BKROOT"
+BK=$BKROOT/deploy-$(date +%Y%m%d-%H%M%S)
+mkdir -m 700 "$BK"
+PREV=$(git rev-parse HEAD)
+echo "$PREV" > "$BK/previous-commit"
+docker compose run --rm -T --no-deps --user 0 -e OWNER="$(id -u):$(id -g)" -v "$BK":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && for f in config.json accounts.json session-secret; do if [ -e /data/$f ]; then cp /data/$f /out/; fi; done && chmod 600 /out/* && chown "$OWNER" /out/*'
+test -f "$BK/doorcontrol.db" && test -f "$BK/config.json"
+STATE=$(python3 -c 'import json,sys; u=json.load(open(sys.argv[1]))["unifi"]; print("http" if not str(u.get("host","")).startswith("https://") else "pinned" if u.get("cert_sha256") else "verified" if u.get("verify_tls") is True else "unpinned")' "$BK/config.json")
+if [ "$STATE" = http ]; then echo "Stop: unifi.host in config.json is not https://. Nothing changed. Backup in $BK"; exit 1; fi
+if [ "$STATE" = unpinned ]; then
+CONSOLE=$(python3 -c 'import json,sys,urllib.parse; u=urllib.parse.urlsplit(json.load(open(sys.argv[1]))["unifi"]["host"]); h=u.hostname; h="[%s]" % h if ":" in h else h; print("%s:%s" % (h, u.port or 443))' "$BK/config.json")
+FP=$(openssl s_client -connect "$CONSOLE" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+if [ -z "$FP" ]; then echo "Stop: could not read the UniFi console certificate from $CONSOLE. Nothing changed."; exit 1; fi
+echo "UniFi console $CONSOLE certificate SHA-256: $FP"
+python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); c["unifi"]["cert_sha256"]=sys.argv[3]; json.dump(c,open(sys.argv[2],"w"),indent=2)' "$BK/config.json" "$BK/config.pinned.json" "$FP"
+docker compose run --rm -T --no-deps app sh -c 'cat > /data/config.json.new && chmod 600 /data/config.json.new && mv /data/config.json.new /data/config.json' < "$BK/config.pinned.json"
+fi
+git checkout -q main
+git pull --ff-only
+docker compose build
+restore_prev() {
+  trap - ERR
+  echo "Deploy FAILED: starting the previous version ($PREV) again."
+  git checkout -q "$PREV" || true
+  docker compose up -d || true
+  docker compose ps || true
+  echo "Backup in $BK"
+}
+trap restore_prev ERR
+docker compose up -d
+S=starting
+for i in $(seq 1 18); do sleep 5; S=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q app)"); if [ "$S" = healthy ]; then break; fi; done
+if [ "$S" != healthy ]; then docker compose logs --tail=40; echo "Stop: the new version is $S, not healthy."; restore_prev; exit 1; fi
+trap - ERR
+docker compose ps
+echo "Deployed $(cat VERSION). Backup in $BK")
+```
+After it: send the Telegram bot `/doors`; the next door change sends an alert to the allowed private
+chats. Check `docker compose exec app python manage.py backup` prints a path.
+
+### Rollback to the previous Docker version (1.1.0 and later)
+Goes back to the commit and data of one `deploy-<time>` folder made by the deploy block. Every check
+runs before the container is stopped: the folder has the database, config.json and previous-commit; it
+was not restored before (a `restored` marker makes a second run stop, so newer data is never
+overwritten twice); the old systemd service is not running; and the running app has no activity or
+schedule changes newer than the backup, unless you type `REPLACE NEWER DATA`. The current data is saved
+to `pre-rollback-<time>` first. Then it stops the container, puts back doorcontrol.db, config.json,
+accounts.json and session-secret, checks out the previous commit and waits for healthy; any failure
+after the stop puts the current version and its data back (`restore_new`).
+```bash
+(set -eE
+cd /srv/fair-apps/door-control
+BKROOT=/srv/fair-apps/door-control-backups
+ls -d "$BKROOT"/deploy-* 2>/dev/null || { echo "Stop: there are no deploy backups. Nothing changed."; exit 1; }
+read -rp "Deploy backup to go back to (for example deploy-20261201-093000): " NAME
+BK=$BKROOT/$NAME
+for f in doorcontrol.db config.json previous-commit; do test -f "$BK/$f" || { echo "Stop: $BK/$f is missing. Nothing changed."; exit 1; }; done
+if [ -e "$BK/restored" ]; then echo "Stop: $NAME was already restored ($(cat "$BK/restored")); again would overwrite newer data. Nothing changed."; exit 1; fi
+PREV=$(cat "$BK/previous-commit")
+git rev-parse --verify -q "$PREV^{commit}" >/dev/null || { echo "Stop: commit $PREV is not known here. Nothing changed."; exit 1; }
+if systemctl is-active --quiet door-control; then echo "Stop: the old systemd service is running. Nothing changed."; exit 1; fi
+NEWER=$(docker compose run --rm -T --no-deps --user 0 -v "$BK":/bk:ro app python -c 'import sqlite3; q=lambda u: sqlite3.connect(u, uri=True).execute("SELECT COALESCE(MAX(ts),0),(SELECT COUNT(*) FROM schedules),(SELECT COALESCE(MAX(id),0) FROM schedules) FROM log").fetchone(); a=q("file:/data/doorcontrol.db?mode=ro"); b=q("file:/bk/doorcontrol.db?mode=ro&immutable=1"); print("newer" if a[0] > b[0] or a[1:] != b[1:] else "same")')
+if [ "$NEWER" != same ]; then
+  echo "Door Control has activity or schedule changes newer than $NAME. Going back replaces them (they are saved in a pre-rollback folder first)."
+  read -rp "Type REPLACE NEWER DATA to continue: " OK
+  if [ "$OK" != "REPLACE NEWER DATA" ]; then echo "Stop: nothing changed."; exit 1; fi
+fi
+umask 077
+CUR=$(git rev-parse HEAD)
+PRE=$BKROOT/pre-rollback-$(date +%Y%m%d-%H%M%S)
+mkdir -m 700 "$PRE"
+echo "$CUR" > "$PRE/previous-commit"
+docker compose run --rm -T --no-deps --user 0 -e OWNER="$(id -u):$(id -g)" -v "$PRE":/out app sh -c 'python -c "import sqlite3; s=sqlite3.connect(\"/data/doorcontrol.db\"); d=sqlite3.connect(\"/out/doorcontrol.db\"); s.backup(d); d.close()" && for f in config.json accounts.json session-secret; do if [ -e /data/$f ]; then cp /data/$f /out/; fi; done && chmod 600 /out/* && chown "$OWNER" /out/*'
+test -f "$PRE/doorcontrol.db" && test -f "$PRE/config.json"
+echo "Current state saved in $PRE"
+put_back() { docker compose run --rm -T --no-deps --user 0 -v "$1":/in:ro app sh -c 'for f in doorcontrol.db config.json accounts.json session-secret; do if [ -e /in/$f ]; then cp /in/$f /data/$f && chown 10001:10001 /data/$f && chmod 600 /data/$f; fi; done'; }
+restore_new() {
+  trap - ERR
+  echo "Rollback FAILED: putting the current version ($CUR) and its data back."
+  docker compose stop || true
+  git checkout -q "$CUR" || true
+  put_back "$PRE" || true
+  docker compose up -d || true
+  docker compose ps || true
+}
+trap restore_new ERR
+docker compose stop
+put_back "$BK"
+git checkout -q "$PREV"
+docker compose up -d
+S=starting
+for i in $(seq 1 18); do sleep 5; S=$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q app)"); if [ "$S" = healthy ]; then break; fi; done
+if [ "$S" != healthy ]; then docker compose logs --tail=40; echo "Stop: the previous version is $S, not healthy."; restore_new; exit 1; fi
+trap - ERR
+date > "$BK/restored"
+docker compose ps
+echo "Back on $(cat VERSION) with the data of $NAME. The data from before is in $PRE")
+```
+If your connection drops after the stop, run `cd /srv/fair-apps/door-control && docker compose up -d`.
+The repository is then on a detached commit; the next deploy block checks out `main` again. Both
+versions run on the same database (migrations are additive).
+
 ### First move from systemd to Docker (1.0.0, one time)
+This block uses `sudo` (stop/disable the old service), so it can stop at a **sudo password prompt**
+halfway through. Run `sudo -v` right before pasting it so sudo is already unlocked.
 Order: README step 2 (Google client) and step 3 (`.env`) -> this block (it also pins the UniFi console
 certificate: it reads the console address from `unifi.host` in config.json, prints the fingerprint and
 saves it as `unifi.cert_sha256`; nothing to type in) -> break-glass account -> README step 4
@@ -168,6 +303,9 @@ another fair-network computer (README "Trusted proxies"); `curl -s -H 'Host: oth
 returns 404; admin sign-in works at doors.jakemc.me; awards.jakemc.me still loads.
 
 ### Rollback to the systemd version
+Only for going back from the first move. It copies the database only: the systemd version reads its own
+`config.json` in the repository folder (it still has the old `web` password), not `/data/config.json`.
+It uses `sudo` too; run `sudo -v` first.
 First remove the `doors.jakemc.me` row from the Cloudflare tunnel (that row only), then run this block. Every check
 runs before the container is stopped; after the stop, any failure (including the old service not
 starting) starts the Docker version again (`restore_new`) so the app is never left down:
@@ -213,13 +351,19 @@ Google Calendar (secret iCal feed, read-only), Telegram (own bot token), Google 
 in Jake's Google Cloud project "HCF Door Control") and the shared Cloudflare tunnel (doors.jakemc.me).
 
 ## Known DRIFT from the standards
-None open in this app. Follow-ups elsewhere: dev-standards APPS.md needs a Door Control row and a
-"Shared code" mention (after deploy).
+None open in this app (O1/R11, no automatic backups, was fixed in 1.1.0). Follow-up elsewhere (O8/R12,
+AC51): dev-standards APPS.md needs a Door Control row and a "Shared code" mention, in a separate
+dev-standards PR after 1.1.0 deploys.
 
 ## App-specific rules
 - A wrong lock/unlock can leave a building open or someone locked out: the scheduler must fail safe
   (retry, never guess) and must not touch a door someone changed by hand.
-- Door names in calendar events match part of the UniFi door name; keep that behavior.
+- Calendar door names (1.1.0, `engine.match_doors`): a whole door name is used as is; otherwise each
+  part must be an exact name or a partial match of exactly one door (Jake's rule); none/several = that
+  part opens nothing and is alerted. "ALL" / "*" never open anything from the calendar.
+- Calendar events open doors only when CONFIRMED, from an allowed organizer, not an unanswered
+  invitation, within `max_window_hours`; feed unknown/stale = no new calendar window, open ones end at
+  their recorded `ends_at`.
 - Deploy blocks build before they stop the running service.
 
 ## History
@@ -229,6 +373,15 @@ None open in this app. Follow-ups elsewhere: dev-standards APPS.md needs a Door 
   break-glass admin password, CSRF, host lockdown, who-did-it activity log (additive `log.user`),
   Docker Compose, CSP + static split, black/prettier, VERSION/CHANGELOG. Review round 1: trusted
   proxies (round 2: own network door-control-net, gateway /32 only; round 3: port on 127.0.0.1 only), overall break-glass cap, request limits, UniFi certificate pinning, plain errors.
+- 1.1.0 (2026-11-28, feature/safety-alerts, PR 1 of the plan in docs/features/safety-alerts; audit
+  docs/audits/2026-11-27.md): calendar safety (status, organizer allowlist, invitations, no ALL, exact
+  matching, validated/bounded RRULEs with nth/last weekday, EXDATE by day, feed checks, unknown/stale,
+  24 h cap), UTC + DST rules, tick lock, end action at end, per-door isolation, hand-change alerts,
+  outage logging, watchdog + `/health` 503, Telegram alerts (notify.py), Telegram offset/age/rate
+  limit/attribution, startup refusal without https + pin, daily backups + `manage.py backup`, log by
+  age, Docker log rotation, TZ, new deploy and rollback blocks. Additive schema: `door_state.source/
+  ends_at/hand_alerted`, `log.kind`, `kv`. No new `.env` lines. Server sessions and the in-app people
+  list (AC40/41/41a) come in PR 2 (1.2.0).
 
 ## Team workflow
 - Standards: .claude/standards/ (synced from the dev-standards repo; don't edit here)

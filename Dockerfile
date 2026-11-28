@@ -9,6 +9,9 @@ COPY doorcontrol ./doorcontrol
 RUN mkdir /data && chown doors:doors /data
 USER doors
 ENV DATA_DIR=/data PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# Log timestamps in local time (stored times stay UTC epochs).
+ENV TZ=America/New_York
 EXPOSE 8480
+# /health answers 503 when the scheduler stalls; urlopen then fails, so Docker shows "unhealthy".
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8480/health',timeout=4)"
 CMD ["python", "run.py"]

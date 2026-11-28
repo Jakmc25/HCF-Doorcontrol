@@ -975,7 +975,16 @@ class IndependenceTests(Base):
         self.assertIn("Not authorized", bot.handle(7, "/doors"))
 
     def test_scheduler_and_bot_do_not_import_sign_in(self):
-        for name in ("engine.py", "telegram_bot.py", "ical.py", "unifi.py", "db.py"):
+        for name in (
+            "engine.py",
+            "telegram_bot.py",
+            "ical.py",
+            "unifi.py",
+            "db.py",
+            "notify.py",
+            "people.py",
+            "backup.py",
+        ):
             tree = ast.parse(read("doorcontrol", name))
             mods = set()
             for node in ast.walk(tree):

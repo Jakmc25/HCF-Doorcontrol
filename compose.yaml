@@ -2,7 +2,7 @@ name: door-control
 services:
   app:
     build: .
-    image: door-control:1.0.0
+    image: door-control:1.1.0
     restart: unless-stopped
     init: true
     # Published on fair-server's loopback only: cloudflared (on the host) connects to
@@ -34,6 +34,12 @@ services:
       - ALL
     pids_limit: 128
     mem_limit: 256m
+    # Docker log rotation. The logs hold sign-in emails and IP addresses (README "Logs").
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 # A fixed, small network so the gateway address above never changes and no other
 # container shares it. If the subnet clashes with another Docker network, see README.
 networks:

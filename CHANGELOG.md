@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.1.0 (2026-11-28)
+Safety fixes from the 2026-11-27 audit, and Telegram alerts.
+- **Calendar safety.** A calendar event opens doors only if it is CONFIRMED, its organizer is allowed
+  (`calendar.allowed_organizers`, else the emails in `GOOGLE_ALLOWED_EMAILS`), it is not an unanswered
+  invitation, and it is at most `calendar.max_window_hours` (24) long including buffers. "ALL" and "*"
+  never open anything. Door names must match exactly one door (a whole door name is never split);
+  unclear parts are skipped and alerted. Repeat rules are checked and bounded (unsupported or
+  malformed ones are skipped and alerted, never looping); monthly "2nd Tuesday" / "last Friday" are
+  supported; a date-only EXDATE cancels that day. An empty, HTML or cut-off feed keeps the last good
+  calendar. Before the first read and when the feed is stale (60 min), no calendar unlock starts and
+  doors already open for an event close at their recorded end. Calendar unlocks are logged as
+  `calendar:<organizer>` with the event title.
+- **Scheduler.** All times compared in UTC: the fall-back hour no longer unlocks twice or stays open an
+  extra hour; a start in the spring-forward gap is skipped and alerted, an end there moves to 03:00.
+  One tick at a time; the end action is chosen when the window ends; an error on one door never
+  stops the others; doors changed by hand in UniFi are reported (checked every 5 minutes) and left
+  alone; one activity row per door and action per UniFi outage; a watchdog makes `/health` answer 503
+  (Docker "unhealthy") when no tick finished for 90 s.
+- **Telegram alerts** to every allowed private chat: door failures, scheduler and calendar problems,
+  backups, schedule changes and every door status change (who, source, until when), with "recovered"
+  messages. Sent from a background queue, so Telegram never slows door control; the same alert repeats
+  at most every 30 minutes; at most 20 a minute. Every kind can be switched off in `alerts.kinds`.
+- **Telegram access.** The update offset is kept in the database (no replay after a restart); messages
+  older than 2 minutes are dropped; 10 commands a minute per chat; group chats and buttons ignored;
+  actions logged as `telegram:<chat id>/<name>`.
+- **Startup refusal.** Door Control refuses to start, sending nothing, unless `unifi.host` is https and
+  `unifi.cert_sha256` is set (or `verify_tls` is true). The new deploy block pins the certificate
+  before the restart.
+- **Operations.** Daily backups in `/data/backups` (database, config.json, accounts.json,
+  session-secret; 14 kept, mode 600) and `manage.py backup`; activity log kept by age (90 days), with
+  sign-ins capped separately; Docker log rotation; container logs in local time; new deploy block
+  (Docker check, backup, pin, healthy wait, automatic return to the previous version) and rollback
+  block (restores config and sign-in files too, refuses to overwrite newer data twice).
+- Additive migration: `door_state.source/ends_at/hand_alerted`, `log.kind`, table `kv`. No new `.env`
+  lines. New optional `config.json` keys (see `config.example.json`).
+
 ## 1.0.0 (2026-11-27)
 First numbered release.
 - Google sign-in (verified hardincountyfair.org accounts) at https://doors.jakemc.me replaces the
