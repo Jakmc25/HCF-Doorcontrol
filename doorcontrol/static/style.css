@@ -312,3 +312,14 @@ button.big,
   border-radius: 6px;
   margin-top: 3px;
 }
+
+/* Calendar stale / not read yet (from /api/health calendar_state). */
+.notice {
+  margin: 12px 0 0;
+  padding: 10px 14px;
+  border: 1px solid var(--warn);
+  border-radius: 8px;
+  background: #fdf0ef;
+  color: var(--warn);
+  font-weight: 600;
+}

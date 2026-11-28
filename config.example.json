@@ -3,11 +3,14 @@
   "unifi": {
     "host": "https://192.168.1.1:12445",
     "token": "PASTE-YOUR-UNIFI-ACCESS-API-TOKEN",
-    "verify_tls": false
+    "verify_tls": false,
+    "cert_sha256": ""
   },
   "telegram": {
     "token": "",
-    "allowed_chat_ids": []
+    "allowed_chat_ids": [],
+    "max_commands_per_minute": 10,
+    "max_age_seconds": 120
   },
   "calendar": {
     "ical_url": "",
@@ -15,8 +18,30 @@
     "title_prefix": "Unlock:",
     "buffer_before_min": 0,
     "buffer_after_min": 0,
-    "end_action": "reset"
+    "end_action": "reset",
+    "calendar_email": "",
+    "stale_minutes": 60,
+    "max_window_hours": 24
+  },
+  "alerts": {
+    "kinds": {
+      "door_error": true,
+      "scheduler": true,
+      "calendar": true,
+      "backup": true,
+      "schedule_change": true,
+      "status": true,
+      "hand_change": true,
+      "people": true,
+      "recovered": true
+    },
+    "repeat_minutes": 30,
+    "max_per_minute": 20,
+    "queue_size": 200,
+    "failures_before_alert": 2
   },
   "default_unlock_minutes": 60,
-  "tick_seconds": 30
+  "tick_seconds": 30,
+  "hand_check_minutes": 5,
+  "log_days": 90
 }

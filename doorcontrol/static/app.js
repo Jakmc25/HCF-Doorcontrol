@@ -267,10 +267,28 @@ async function loadLog() {
       "</table>"
     : '<div class="card muted">No activity yet.</div>';
 }
+// Calendar health notice. A failure here never shows a toast: the rest of the page works.
+const CALENDAR_NOTICE = {
+  stale:
+    "Calendar stale: the calendar feed has not been read for over an hour. New calendar unlocks are paused; doors already open for an event close at its end.",
+  unknown:
+    "Calendar not read yet: calendar unlocks start after the first successful read.",
+};
+async function loadHealth() {
+  const n = $("calnotice");
+  try {
+    const h = await api("GET", "/api/health");
+    const text = CALENDAR_NOTICE[h.calendar_state] || "";
+    n.textContent = text;
+    n.hidden = !text;
+  } catch (e) {
+    n.hidden = true;
+  }
+}
 async function refreshAll() {
   await loadDoors();
   await Promise.all(
-    [loadSchedules(), loadUpcoming(), loadLog()].map((p) =>
+    [loadSchedules(), loadUpcoming(), loadLog(), loadHealth()].map((p) =>
       p.catch((e) => toast(e.message, true)),
     ),
   );
@@ -304,6 +322,7 @@ setInterval(() => {
   loadDoors();
   loadUpcoming();
   loadLog();
+  loadHealth();
 }, 20000);
 // Keep the CSRF token fresh on a dashboard left open for days.
 setInterval(() => bootstrap().catch(() => {}), 3600000);

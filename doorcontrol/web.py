@@ -422,7 +422,10 @@ class Handler(BaseHTTPRequestHandler):
                 and is_loopback(self.client_address[0])
                 and not self.headers.get("CF-Connecting-IP")
             ):
-                return self.send(200, {"ok": True, "version": VERSION})
+                # 503 when the scheduler stalled (Docker's HEALTHCHECK then reports
+                # unhealthy). Nothing else is shown here.
+                ok = bool(self.engine.healthy())
+                return self.send(200 if ok else 503, {"ok": ok, "version": VERSION})
             raise LookupError("Not found.")
 
         public = self.server.public_hosts
@@ -525,7 +528,9 @@ class Handler(BaseHTTPRequestHandler):
             log.warning("google sign-in refused: %s (%s)", e, self.ip())
             return self.send(403, google_signin.page(str(e)), HTML)
         log.info("signed in with Google: %s (%s)", email, self.ip())
-        self.engine.db.log("", "sign-in", "web", True, "signed in", user=email)
+        self.engine.db.log(
+            "", "sign-in", "web", True, "signed in", user=email, kind="signin"
+        )
         return self.send(
             200,
             google_signin.page(),
@@ -556,7 +561,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(401, {"error": "Wrong name or password."})
         log.info("admin sign-in: admin:%s (%s)", name, ip)
         self.engine.db.log(
-            "", "sign-in", "web", True, "signed in (password)", user="admin:" + name
+            "",
+            "sign-in",
+            "web",
+            True,
+            "signed in (password)",
+            user="admin:" + name,
+            kind="signin",
         )
         return self.send(
             200, {"ok": True}, extra={"Set-Cookie": a.cookie_header(a.issue(name))}
@@ -600,45 +611,23 @@ class Handler(BaseHTTPRequestHandler):
     def api_schedules(self):
         return self.send(200, self.engine.db.schedules())
 
-    def note(self, action, detail):
-        """Activity log row for a change made on the dashboard."""
-        self.engine.db.log("", action, "web", True, detail, user=self.user)
-
+    # Schedule changes go through the engine: activity log and Telegram alert with who did it.
     def api_add_schedule(self):
         s = validate_schedule(self.body())
-        sid = self.engine.db.add_schedule(s)
-        self.note("schedule add", 'added schedule "%s"' % s["name"])
+        sid = self.engine.add_schedule(s, user=self.user)
         self.tick_soon()
         return self.send(201, {"id": sid})
 
     def api_edit_schedule(self, sid):
         sid = int(sid)
-        old = self.engine.db.get_schedule(sid)
-        if not old:
+        if not self.engine.db.get_schedule(sid):
             raise LookupError("No such schedule")
-        new = validate_schedule(self.body())
-        if not self.engine.db.update_schedule(sid, new):
-            raise LookupError("No such schedule")
-        same = all(old.get(k) == v for k, v in new.items() if k != "enabled")
-        if same and old["enabled"] != new["enabled"]:
-            verb = "resume" if new["enabled"] else "pause"
-            self.note("schedule " + verb, '%sd schedule "%s"' % (verb, new["name"]))
-        elif old["name"] != new["name"]:
-            self.note(
-                "schedule edit",
-                'changed schedule "%s" (now "%s")' % (old["name"], new["name"]),
-            )
-        else:
-            self.note("schedule edit", 'changed schedule "%s"' % new["name"])
+        self.engine.update_schedule(sid, validate_schedule(self.body()), user=self.user)
         self.tick_soon()
         return self.send(200, {"ok": True})
 
     def api_delete_schedule(self, sid):
-        sid = int(sid)
-        old = self.engine.db.get_schedule(sid)
-        if not old or not self.engine.db.delete_schedule(sid):
-            raise LookupError("No such schedule")
-        self.note("schedule delete", 'deleted schedule "%s"' % old["name"])
+        self.engine.delete_schedule(int(sid), user=self.user)
         self.tick_soon()
         return self.send(200, {"ok": True})
 
@@ -665,17 +654,15 @@ class Handler(BaseHTTPRequestHandler):
                     if e.last_error
                     else None
                 ),
+                "scheduler_ok": bool(e.healthy()),
                 "calendar_enabled": bool(cal and cal.url),
+                "calendar_state": cal.state() if cal else "off",
                 "calendar_last_ok": cal.last_ok if cal else None,
                 "calendar_error": cal.last_error if cal else None,
+                "alerts": e.notifier.stats(),
             },
         )
 
     def tick_soon(self):
-        threading.Thread(target=self._safe_tick, daemon=True).start()
-
-    def _safe_tick(self):
-        try:
-            self.engine.tick()
-        except Exception as e:
-            log.warning("tick after change failed: %s", e)
+        # The engine's tick lock: never two ticks at once; a busy tick runs once more.
+        threading.Thread(target=self.engine.request_tick, daemon=True).start()
