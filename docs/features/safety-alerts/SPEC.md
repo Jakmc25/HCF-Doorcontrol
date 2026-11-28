@@ -19,7 +19,7 @@ Every BLOCKER, SHOULD-FIX and NIT in the audit is fixed and tested, and every er
 Event acceptance (S2)
 - [ ] AC1: Given an event with STATUS other than CONFIRMED (TENTATIVE, CANCELLED, missing), when windows are built, then it creates no window. A missing STATUS is treated as not confirmed.
 - [ ] AC2: Given an event whose ORGANIZER email is not in the organizer allowlist, or has no ORGANIZER, when windows are built, then it creates no window, the refusal is logged with the organizer and title, and an alert is sent (deduplicated).
-- [ ] AC3: Given config `calendar.allowed_organizers` is absent, then the allowlist defaults to the emails allowed to sign in (`GOOGLE_ALLOWED_EMAILS`). Given it is set, then only those emails count. If both are empty, no calendar event creates a window and one startup alert says why.
+- [ ] AC3: Given config `calendar.allowed_organizers` is absent, then the allowlist defaults to the emails allowed to sign in (admins in `GOOGLE_ALLOWED_EMAILS` plus the in-app list, AC41a). Given it is set, then only those emails count. If both are empty, no calendar event creates a window and one startup alert says why.
 - [ ] AC4: Given an invitation (event where the organizer is someone else and our attendee PARTSTAT is NEEDS-ACTION or TENTATIVE), then it never creates a window, even if the organizer is allowlisted.
 - [ ] AC5: Given the name "ALL" (any case) or "*" in an event, then it opens nothing, is logged, and an alert is sent. The calendar never opens every door.
 
@@ -78,7 +78,8 @@ Messages to every allowed chat:
 
 ### E. Access tightening (S6, S7, S8)
 - [ ] AC40 (S6): Given a Google or password sign-in, then a server-side session is stored (only a hash of the id), lasts 12 hours, and can be revoked. Given a user is removed from the allowed list and the app restarts, or the session is revoked with `manage.py`, then the next request is refused at once. Old 14-day stateless cookies stop working after the upgrade (everyone signs in again once).
-- [ ] AC41 (S7): Given `GOOGLE_ALLOWED_EMAILS` lists named people and `GOOGLE_ALLOWED_DOMAINS` is empty, then only those emails can sign in; any other hardincountyfair.org account is refused and logged. Given both are empty, then nobody signs in with Google (break-glass password still works).
+- [ ] AC41 (S7): Given `GOOGLE_ALLOWED_EMAILS` lists the admins (jake@hardincountyfair.org, kolt@hardincountyfair.org at deploy) and `GOOGLE_ALLOWED_DOMAINS` is empty, then only admins and people on the in-app list can sign in; any other account, including other hardincountyfair.org accounts, is refused and logged. Given both are empty and the in-app list is empty, nobody signs in with Google (break-glass password still works).
+- [ ] AC41a: Given an admin (an email in `GOOGLE_ALLOWED_EMAILS`) opens Settings › People, then they can add an email (checked format, case-insensitive, no duplicates) and remove one, with a typed confirmation for removal. The in-app list is stored in the database (additive table). People on the in-app list can use the dashboard but cannot see or change the list; admins cannot be removed in the app (only in `.env`). Removing a person ends their sessions at once. Every add/remove is logged with who did it and sent as a Telegram alert. Calendar organizers (AC3) default to admins plus the in-app list.
 - [ ] AC42 (S8): Given the UniFi host is not https, or there is no `cert_sha256` pin and `verify_tls` is not true, then the app refuses to start with a plain message and sends no token. Given an unpinned install after upgrade, then the deploy block pins before the restart (see F) so doors never go unmanaged.
 - [ ] AC43: Given `/health` is called, then it is still loopback only and shows no sensitive details.
 
@@ -96,7 +97,7 @@ Messages to every allowed chat:
 - [ ] AC52: New tests cover Q1 (empty/HTML/truncated feed, startup before first fetch), Q2 (partial matches: none, one, several, "Pole Barn and Arena"), Q3 (both DST transitions), overlap windows, a CANCELLED event, UniFi timeouts and a 500 on the end lock, malformed RRULEs (BYMONTHDAY 0/32/40, bad COUNT/INTERVAL, unknown FREQ and TZID), Telegram replay (old message, restart offset), group chats/callbacks, notification queue behavior with Telegram down, dedupe/summary, sessions (expiry, revoke), and startup refusal without https/pin. Existing tests, black and prettier stay clean. Node UI tests cover the "calendar stale" notice.
 
 ## Audit ID map
-S2 AC1-5. S1/R2 AC9-10. Q1/R1 AC13-14,16. Q2/R3 AC6-8. Q3/R8 AC19-20. R4 AC11-12. R6 AC22. Q4/R7 AC23-24. S3 AC18. R9 AC15,17. S4/R5 AC37-38. S5 AC21,39. S6 AC40. S7 AC41. S8 AC42. O3 AC29-35. O4/R10 AC26. O1/R11 AC44. O2 AC45. O5/O6 AC46. O7/S10 AC47. O8/R12 AC51. S9 AC28. Q5 AC27. Q6 AC36. O9 AC48. O10 AC49. R13 AC50.
+S2 AC1-5. S1/R2 AC9-10. Q1/R1 AC13-14,16. Q2/R3 AC6-8. Q3/R8 AC19-20. R4 AC11-12. R6 AC22. Q4/R7 AC23-24. S3 AC18. R9 AC15,17. S4/R5 AC37-38. S5 AC21,39. S6 AC40. S7 AC41, AC41a. S8 AC42. O3 AC29-35. O4/R10 AC26. O1/R11 AC44. O2 AC45. O5/O6 AC46. O7/S10 AC47. O8/R12 AC51. S9 AC28. Q5 AC27. Q6 AC36. O9 AC48. O10 AC49. R13 AC50.
 
 ## Out of scope
 - Reading any calendar by default; no feed is configured today (README documents setup of a dedicated internal calendar with invitations off).
@@ -111,11 +112,14 @@ S2 AC1-5. S1/R2 AC9-10. Q1/R1 AC13-14,16. Q2/R3 AC6-8. Q3/R8 AC19-20. R4 AC11-12
 - Shares the Cloudflare tunnel and OAuth client with Awards, Budget, Thank You, Incident Report; no change to them. Raising `GOOGLE_ALLOWED_EMAILS` here is this app's `.env` only.
 - Telegram bot token is this app's own.
 
-## Open questions (default if unanswered)
-1. Who goes in `GOOGLE_ALLOWED_EMAILS` for Door Control? Default: Jake's list filled in at deploy; domain list empty; until filled, only the break-glass password works.
-2. Which Telegram chats get alerts? Default: all `allowed_chat_ids`.
-3. Should status-change alerts for every unlock/lock be on by default, or can they be quiet for scheduled actions? Default: all on, as requested; builder adds a config switch per kind.
-4. Spring-forward start in the missing hour: move to the next valid time or refuse? Default: refuse, log and alert.
-5. RRULE "nth weekday": support or skip? Default: support "nth/last weekday" monthly, skip everything else with an alert.
-6. Alert repeat interval and per-minute cap (30 min / 20). Default as stated.
-7. Backup folder location and whether copies also go off-server. Default: `/data/backups` only; deploy backup to `/srv/fair-apps/door-control-backups`.
+## Decisions (Jake, 2026-11-28)
+1. Admins: Jake and Kolt in `GOOGLE_ALLOWED_EMAILS`; more people added in the app by an admin (AC41a). Domain list empty.
+2. Alerts go to every allowed Telegram chat.
+3. All alert kinds on by default, with a config switch per kind.
+4. A spring-forward start in the missing hour is refused, logged and alerted.
+5. Monthly nth/last weekday supported; other unsupported rules skipped with an alert.
+6. Same alert repeats at most every 30 min; at most 20 messages a minute.
+7. Daily backups in `/data/backups` (14 kept); deploy-block backups in `/srv/fair-apps/door-control-backups`.
+
+## Open questions
+None.
